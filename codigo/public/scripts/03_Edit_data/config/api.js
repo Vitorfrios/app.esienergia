@@ -193,6 +193,7 @@ export async function saveData(options = {}) {
           }
         })
       );
+      backgroundSyncOfflineAfterSave();
       return {
         success: true,
         changedSections,
@@ -230,6 +231,237 @@ function getRealPendingChanges() {
   }
 
   return realChanges;
+}
+
+function isOfflineSyncAvailable() {
+  const hostname = String(window.location.hostname || "").toLowerCase();
+  return !hostname.endsWith(".onrender.com");
+}
+
+function updateOfflineSyncButtonsState() {
+  const buttons = [
+    document.getElementById("importOfflineDatabaseBtn"),
+    document.getElementById("exportOfflineDatabaseBtn"),
+  ].filter(Boolean);
+
+  if (buttons.length === 0) {
+    return;
+  }
+
+  const available = isOfflineSyncAvailable();
+  buttons.forEach((button) => {
+    button.disabled = !available;
+    button.title = available
+      ? "Sincronizacao offline habilitada neste ambiente."
+      : "Disponivel apenas fora do ambiente Render.";
+  });
+}
+
+let offlineReconcileInFlight = false;
+let offlineReconnectMonitorStarted = false;
+let lastOfflineConflictSignature = "";
+let lastOfflineCapacitySignature = "";
+
+async function callOfflineSyncEndpoint(endpoint, { silent = false } = {}) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const error = new Error(
+      result.error || `Falha na sincronizacao (HTTP ${response.status}).`,
+    );
+    error.isConflict = response.status === 409 || result.conflict === true;
+    error.payload = result;
+    if (!silent) {
+      throw error;
+    }
+    return { success: false, error: error.message, ...result };
+  }
+
+  return result;
+}
+
+function buildOfflineConflictSignature(conflicts) {
+  return (conflicts || [])
+    .map((item) => `${item.table || ""}:${item.item || ""}`)
+    .sort()
+    .join("|");
+}
+
+function notifyOfflineReconcileWarnings(result) {
+  const conflicts = Array.isArray(result?.conflicts) ? result.conflicts : [];
+  const conflictSignature = buildOfflineConflictSignature(conflicts);
+  if (conflicts.length > 0 && conflictSignature !== lastOfflineConflictSignature) {
+    lastOfflineConflictSignature = conflictSignature;
+    const listedItems = conflicts
+      .slice(0, 3)
+      .map((item) => item.item)
+      .filter(Boolean)
+      .join(", ");
+    const warningMessage = listedItems
+      ? `Desincronizacao detectada em ${conflicts.length} item(ns): ${listedItems}. Sugestao: verificar antes de sincronizar manualmente.`
+      : `Desincronizacao detectada em ${conflicts.length} item(ns). Sugestao: verificar antes de sincronizar manualmente.`;
+    showWarning(warningMessage);
+    console.warn(" Itens com dupla modificacao online/offline:", conflicts);
+  } else if (conflicts.length === 0) {
+    lastOfflineConflictSignature = "";
+  }
+
+  const blockedCount = Number(result?.blocked_offline_to_online_count || 0);
+  const capacitySignature = `${blockedCount}:${result?.storage_status?.percent_used || 0}`;
+  if (blockedCount > 0 && capacitySignature !== lastOfflineCapacitySignature) {
+    lastOfflineCapacitySignature = capacitySignature;
+    showWarning(
+      `${blockedCount} alteracao(oes) offline ficaram pendentes porque o online esta sem espaco suficiente no momento.`,
+    );
+  } else if (blockedCount === 0) {
+    lastOfflineCapacitySignature = "";
+  }
+}
+
+async function reconcileOfflineAndOnline({
+  endpoint = "/api/system/offline/reconcile",
+} = {}) {
+  if (!isOfflineSyncAvailable()) {
+    return { success: false, skipped: true };
+  }
+
+  if (offlineReconcileInFlight) {
+    return {
+      success: false,
+      skipped: true,
+      message: "Uma reconciliacao offline/online ja esta em andamento.",
+    };
+  }
+
+  offlineReconcileInFlight = true;
+  try {
+    const result = await callOfflineSyncEndpoint(endpoint, { silent: true });
+    notifyOfflineReconcileWarnings(result);
+
+    if (result?.success) {
+      console.log(
+        result?.message || " Reconciliacao offline/online executada com sucesso.",
+      );
+      return result;
+    }
+
+    if (result?.skipped) {
+      console.info(
+        result?.message ||
+          " Reconciliacao offline/online preservou o estado local.",
+      );
+      return result;
+    }
+
+    console.warn(
+      " Falha na reconciliacao offline/online:",
+      result?.error || result?.message || "erro desconhecido",
+    );
+    return result;
+  } catch (error) {
+    console.warn(" Falha na reconciliacao offline/online:", error);
+    return { success: false, error: error.message };
+  } finally {
+    offlineReconcileInFlight = false;
+  }
+}
+
+async function backgroundSyncOfflineAfterSave() {
+  return reconcileOfflineAndOnline({
+    endpoint: "/api/system/offline/background-save",
+  });
+}
+
+export async function importOnlineToOffline() {
+  try {
+    const realPendingChanges = getRealPendingChanges();
+    if (realPendingChanges.size > 0) {
+      showLoading("Salvando alteracoes antes da importacao...");
+      const saveResult = await saveDataWithFix({ silent: true });
+      if (!saveResult?.success) {
+        throw new Error(
+          saveResult?.error ||
+            "Nao foi possivel salvar as alteracoes antes da importacao.",
+        );
+      }
+    }
+
+    showLoading("Importando dados online para o banco offline...");
+    const result = await callOfflineSyncEndpoint("/api/system/offline/import");
+
+    const totalRegistros = Object.values(result.table_counts || {}).reduce(
+      (total, count) => total + Number(count || 0),
+      0,
+    );
+
+    showSuccess(
+      `Importacao concluida. ${totalRegistros} registros copiados para database/app.sqlite3.`,
+    );
+
+    if (result.sql_dump_path) {
+      showInfo("Copia de seguranca de dados local atualizada com sucesso.");
+    }
+
+    return result;
+  } catch (error) {
+    console.error("Erro ao importar online para offline:", error);
+    showError(`Erro ao importar: ${error.message}`);
+    return { success: false, error: error.message };
+  } finally {
+    hideLoading();
+  }
+}
+
+export async function exportOfflineToOnline() {
+  try {
+    showLoading("Exportando banco offline para o online...");
+    const result = await callOfflineSyncEndpoint("/api/system/offline/export");
+
+    if (result?.skipped) {
+      showInfo(result.message || "Nenhuma alteracao offline pendente para exportar.");
+      return result;
+    }
+
+    showSuccess(result.message || "Banco offline exportado com sucesso.");
+    await loadData();
+    return result;
+  } catch (error) {
+    console.error("Erro ao exportar offline para online:", error);
+    showError(`Erro ao exportar: ${error.message}`);
+    return { success: false, error: error.message };
+  } finally {
+    hideLoading();
+  }
+}
+
+function startOfflineReconnectMonitor() {
+  if (!isOfflineSyncAvailable() || offlineReconnectMonitorStarted) {
+    return;
+  }
+
+  offlineReconnectMonitorStarted = true;
+
+  const triggerReconcile = () => {
+    reconcileOfflineAndOnline();
+  };
+
+  window.addEventListener("online", triggerReconcile);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      triggerReconcile();
+    }
+  });
+
+  setTimeout(triggerReconcile, 2000);
+  window.setInterval(triggerReconcile, 60000);
 }
 
 // Função para corrigir dados automaticamente
@@ -367,3 +599,9 @@ window.saveData = saveDataWithFix; // Usar versão com correção
 window.saveDataSilently = saveDataSilently;
 window.fixDataIssues = fixDataIssues;
 window.debugDataValidation = debugDataValidation;
+window.importOnlineToOffline = importOnlineToOffline;
+window.exportOfflineToOnline = exportOfflineToOnline;
+window.addEventListener("DOMContentLoaded", () => {
+  updateOfflineSyncButtonsState();
+  startOfflineReconnectMonitor();
+});

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -166,6 +168,48 @@ _WARMUP_STARTED_ROOTS = set()
 _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE = {}
 _DOTENV_LOCK = threading.Lock()
 _DOTENV_LOADED_PATHS = set()
+SYNC_METADATA_FILENAME = "sync-metadata.json"
+SYNC_BASELINE_FILENAME = "sync-base.json"
+_SQLITE_SYNC_TABLES = (
+    "admins",
+    "empresas",
+    "constants",
+    "materials",
+    "machine_catalog",
+    "acessorios",
+    "dutos",
+    "tubos",
+    "obras",
+    "projetos",
+    "salas",
+    "sala_maquinas",
+    "sessions",
+    "admin_email_config",
+    "obra_notifications",
+)
+_SQLITE_SYNC_DELETE_ORDER = tuple(reversed(_SQLITE_SYNC_TABLES))
+_SYNC_PRIMARY_KEYS = {
+    "admins": ("usuario",),
+    "empresas": ("codigo",),
+    "constants": ("key",),
+    "materials": ("key",),
+    "machine_catalog": ("type",),
+    "acessorios": ("tipo",),
+    "dutos": ("type",),
+    "tubos": ("polegadas",),
+    "obras": ("id",),
+    "projetos": ("id",),
+    "salas": ("id",),
+    "sala_maquinas": ("id",),
+    "sessions": ("session_id",),
+    "admin_email_config": ("config_key",),
+    "obra_notifications": ("obra_id",),
+}
+_SYNC_CONFLICT_METADATA_LIMIT = 50
+
+
+class SyncConflictError(RuntimeError):
+    """Erro de conflito entre snapshot local e banco online."""
 
 
 @dataclass(frozen=True)
@@ -208,6 +252,14 @@ class SQLiteTable:
 
 def get_database_path(project_root) -> Path:
     return Path(project_root) / "database" / "app.sqlite3"
+
+
+def get_sync_metadata_path(project_root) -> Path:
+    return Path(project_root) / "database" / SYNC_METADATA_FILENAME
+
+
+def get_sync_baseline_path(project_root) -> Path:
+    return Path(project_root) / "database" / SYNC_BASELINE_FILENAME
 
 
 def get_database_url(project_root=None) -> str:
@@ -311,6 +363,19 @@ def _run_connection_warmup(project_root) -> None:
         get_connection(project_root)
         release_thread_connection(project_root)
         print(" PostgreSQL pronto para uso.")
+        startup_sync_result = refresh_offline_snapshot_on_startup(project_root)
+        if startup_sync_result.get("success"):
+            print(" Snapshot offline local atualizado na inicializacao.")
+        elif startup_sync_result.get("skipped"):
+            print(
+                " Snapshot offline local preservado na inicializacao:",
+                startup_sync_result.get("message") or startup_sync_result.get("error"),
+            )
+        elif startup_sync_result.get("error"):
+            print(
+                " Aviso na atualizacao do snapshot offline na inicializacao:",
+                startup_sync_result["error"],
+            )
     except Exception as exc:
         print(f" Aviso no warmup do PostgreSQL: {exc}")
 
@@ -324,6 +389,1032 @@ def migrate_sqlite_to_postgres(project_root):
     }
     release_thread_connection(project_root)
     return summary
+
+
+def refresh_offline_snapshot_on_startup(project_root):
+    if os.environ.get("RENDER"):
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Ambiente Render nao utiliza snapshot offline local.",
+            "mode": "startup-refresh",
+        }
+
+    return reconcile_offline_and_online(
+        project_root,
+        mode="startup-refresh",
+    )
+
+
+def sync_postgres_to_sqlite(project_root, *, mode="manual-import", allow_unmanaged_local=True):
+    project_root = Path(project_root).resolve()
+    database_dir = project_root / "database"
+    database_dir.mkdir(parents=True, exist_ok=True)
+
+    sqlite_path = get_database_path(project_root).resolve()
+    conn = get_connection(project_root)
+
+    try:
+        current_state = _get_current_sync_state(project_root, conn)
+        online_payload = current_state["online_payload"]
+        local_payload = current_state["local_payload"]
+        baseline_payload = current_state["baseline_payload"]
+        baseline_available = current_state["baseline_available"]
+
+        if (
+            current_state["sqlite_exists"]
+            and baseline_available
+            and local_payload != baseline_payload
+        ):
+            raise SyncConflictError(
+                "O banco offline local possui alteracoes fora da ultima sincronizacao gerenciada. "
+                "Exporte o offline antes de importar o online."
+            )
+
+        if (
+            current_state["sqlite_exists"]
+            and _payload_has_data(local_payload)
+            and not baseline_available
+            and not allow_unmanaged_local
+        ):
+            raise SyncConflictError(
+                "O banco offline local ja possui dados sem historico de sincronizacao. "
+                "Importe manualmente apenas se quiser sobrescrever o snapshot local atual."
+            )
+
+        sqlite_summary = _write_sync_payload_to_sqlite_files(project_root, online_payload)
+        persisted_state = _persist_sync_state(
+            project_root,
+            baseline_payload=online_payload,
+            offline_payload=online_payload,
+            online_payload=online_payload,
+            mode=mode,
+            sqlite_path=sqlite_summary["sqlite_path"],
+            sql_dump_path=sqlite_summary["sql_dump_path"],
+            import_applied=True,
+            export_applied=False,
+            conflicts=[],
+            blocked_offline_changes=[],
+            status="aligned",
+        )
+
+        return {
+            **sqlite_summary,
+            "online_digest": persisted_state["online_digest"],
+            "local_digest": persisted_state["offline_digest"],
+            "sync_metadata_path": persisted_state["sync_metadata_path"],
+            "sync_baseline_path": persisted_state["sync_baseline_path"],
+            "mode": mode,
+            "synced_at": persisted_state["synced_at"],
+        }
+    finally:
+        release_thread_connection(project_root)
+
+
+def sync_sqlite_to_postgres(project_root, *, mode="manual-export"):
+    project_root = Path(project_root).resolve()
+    sqlite_path = get_database_path(project_root).resolve()
+    if not sqlite_path.exists():
+        raise FileNotFoundError(
+            f"Banco offline nao encontrado em {sqlite_path}."
+        )
+
+    conn = get_connection(project_root)
+
+    try:
+        current_state = _get_current_sync_state(project_root, conn)
+        local_payload = current_state["local_payload"]
+        online_payload = current_state["online_payload"]
+        baseline_payload = current_state["baseline_payload"]
+
+        if not current_state["baseline_available"]:
+            if online_payload == local_payload:
+                sql_dump_path = _refresh_sql_dump_from_existing_sqlite(project_root)
+                persisted_state = _persist_sync_state(
+                    project_root,
+                    baseline_payload=local_payload,
+                    offline_payload=local_payload,
+                    online_payload=online_payload,
+                    mode="bootstrap-aligned",
+                    sqlite_path=str(sqlite_path),
+                    sql_dump_path=str(sql_dump_path),
+                    import_applied=False,
+                    export_applied=False,
+                    conflicts=[],
+                    blocked_offline_changes=[],
+                    status="aligned",
+                )
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "message": "Offline e online ja estavam alinhados. Base de sincronizacao inicializada.",
+                    "online_digest": persisted_state["online_digest"],
+                    "local_digest": persisted_state["offline_digest"],
+                    "sync_metadata_path": persisted_state["sync_metadata_path"],
+                    "sync_baseline_path": persisted_state["sync_baseline_path"],
+                    "mode": mode,
+                }
+
+            raise SyncConflictError(
+                "Nao existe base de sincronizacao confiavel entre offline e online. "
+                "Use Importar primeiro para criar a base antes de Exportar."
+            )
+
+        if online_payload != baseline_payload:
+            raise SyncConflictError(
+                "O banco online mudou depois da ultima base sincronizada com o offline. "
+                "Importe novamente antes de exportar para evitar sobrescrever dados online."
+            )
+
+        if local_payload == baseline_payload and online_payload == baseline_payload:
+            return {
+                "success": True,
+                "skipped": True,
+                "message": "Nenhuma alteracao offline pendente para exportar.",
+                "online_digest": _compute_sync_payload_digest(online_payload),
+                "local_digest": _compute_sync_payload_digest(local_payload),
+                "sync_metadata_path": str(get_sync_metadata_path(project_root).resolve()),
+                "sync_baseline_path": str(get_sync_baseline_path(project_root).resolve()),
+                "mode": mode,
+            }
+
+        table_counts = _write_sync_payload_to_postgres(conn, local_payload)
+        sql_dump_path = _refresh_sql_dump_from_existing_sqlite(project_root)
+        refreshed_online_payload = _dump_postgres_sync_payload(conn, _SQLITE_SYNC_TABLES)
+        persisted_state = _persist_sync_state(
+            project_root,
+            baseline_payload=refreshed_online_payload,
+            offline_payload=local_payload,
+            online_payload=refreshed_online_payload,
+            mode=mode,
+            sqlite_path=str(sqlite_path),
+            sql_dump_path=str(sql_dump_path),
+            import_applied=False,
+            export_applied=True,
+            conflicts=[],
+            blocked_offline_changes=[],
+            status="aligned",
+        )
+
+        return {
+            "success": True,
+            "message": "Banco offline exportado com sucesso para o banco online.",
+            "table_counts": table_counts,
+            "online_digest": persisted_state["online_digest"],
+            "local_digest": persisted_state["offline_digest"],
+            "sql_dump_path": str(sql_dump_path),
+            "sync_metadata_path": persisted_state["sync_metadata_path"],
+            "sync_baseline_path": persisted_state["sync_baseline_path"],
+            "mode": mode,
+            "synced_at": persisted_state["synced_at"],
+        }
+    finally:
+        release_thread_connection(project_root)
+
+
+def reconcile_offline_and_online(project_root, *, mode="auto-reconcile"):
+    if os.environ.get("RENDER"):
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Ambiente Render nao utiliza snapshot offline local.",
+            "mode": mode,
+        }
+
+    project_root = Path(project_root).resolve()
+    conn = None
+
+    try:
+        conn = get_connection(project_root)
+        current_state = _get_current_sync_state(project_root, conn)
+        online_payload = current_state["online_payload"]
+        local_payload = current_state["local_payload"]
+        sqlite_path = current_state["sqlite_path"]
+
+        if not current_state["baseline_available"]:
+            if not current_state["sqlite_exists"] or not _payload_has_data(local_payload):
+                sqlite_summary = _write_sync_payload_to_sqlite_files(project_root, online_payload)
+                persisted_state = _persist_sync_state(
+                    project_root,
+                    baseline_payload=online_payload,
+                    offline_payload=online_payload,
+                    online_payload=online_payload,
+                    mode=mode,
+                    sqlite_path=sqlite_summary["sqlite_path"],
+                    sql_dump_path=sqlite_summary["sql_dump_path"],
+                    import_applied=True,
+                    export_applied=False,
+                    conflicts=[],
+                    blocked_offline_changes=[],
+                    status="aligned",
+                )
+                return {
+                    "success": True,
+                    "message": "Copia local inicial criada a partir do banco online.",
+                    "table_counts": sqlite_summary["table_counts"],
+                    "online_digest": persisted_state["online_digest"],
+                    "local_digest": persisted_state["offline_digest"],
+                    "sync_metadata_path": persisted_state["sync_metadata_path"],
+                    "sync_baseline_path": persisted_state["sync_baseline_path"],
+                    "mode": mode,
+                    "synced_at": persisted_state["synced_at"],
+                }
+
+            if local_payload == online_payload:
+                sql_dump_path = _refresh_sql_dump_from_existing_sqlite(project_root)
+                persisted_state = _persist_sync_state(
+                    project_root,
+                    baseline_payload=local_payload,
+                    offline_payload=local_payload,
+                    online_payload=online_payload,
+                    mode="bootstrap-aligned",
+                    sqlite_path=str(sqlite_path),
+                    sql_dump_path=str(sql_dump_path),
+                    import_applied=False,
+                    export_applied=False,
+                    conflicts=[],
+                    blocked_offline_changes=[],
+                    status="aligned",
+                )
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "message": "Offline e online ja estavam alinhados. Base de sincronizacao inicializada.",
+                    "online_digest": persisted_state["online_digest"],
+                    "local_digest": persisted_state["offline_digest"],
+                    "sync_metadata_path": persisted_state["sync_metadata_path"],
+                    "sync_baseline_path": persisted_state["sync_baseline_path"],
+                    "mode": mode,
+                }
+
+            return {
+                "success": False,
+                "skipped": True,
+                "conflict": True,
+                "message": (
+                    "Nao existe base confiavel para reconciliar automaticamente offline e online. "
+                    "Use Importar primeiro ou alinhe manualmente a base local."
+                ),
+                "mode": mode,
+            }
+
+        storage_status = _get_online_storage_status(conn)
+        merge_result = _merge_sync_payloads(
+            current_state["baseline_payload"],
+            local_payload,
+            online_payload,
+            allow_online_writes=storage_status["storage_available_for_writes"],
+        )
+
+        final_online_payload = merge_result["final_online_payload"]
+        final_offline_payload = merge_result["final_offline_payload"]
+        baseline_payload = merge_result["baseline_payload"]
+
+        table_counts = {}
+        if final_online_payload != online_payload:
+            table_counts = _write_sync_payload_to_postgres(conn, final_online_payload)
+            final_online_payload = _dump_postgres_sync_payload(conn, _SQLITE_SYNC_TABLES)
+
+        if (not current_state["sqlite_exists"]) or final_offline_payload != local_payload:
+            sqlite_summary = _write_sync_payload_to_sqlite_files(project_root, final_offline_payload)
+            sql_dump_path = sqlite_summary["sql_dump_path"]
+            if not table_counts:
+                table_counts = sqlite_summary["table_counts"]
+        else:
+            sql_dump_path = str(_refresh_sql_dump_from_existing_sqlite(project_root))
+
+        persisted_state = _persist_sync_state(
+            project_root,
+            baseline_payload=baseline_payload,
+            offline_payload=final_offline_payload,
+            online_payload=final_online_payload,
+            mode=mode,
+            sqlite_path=str(get_database_path(project_root).resolve()),
+            sql_dump_path=str(sql_dump_path),
+            import_applied=merge_result["online_to_offline_count"] > 0,
+            export_applied=merge_result["offline_to_online_count"] > 0,
+            conflicts=merge_result["conflicts"],
+            blocked_offline_changes=merge_result["blocked_offline_changes"],
+            status=(
+                "conflict"
+                if merge_result["conflicts"]
+                else (
+                    "capacity-pending"
+                    if merge_result["blocked_offline_changes"]
+                    else "aligned"
+                )
+            ),
+        )
+
+        message_parts = []
+        if merge_result["offline_to_online_count"] > 0:
+            message_parts.append(
+                f"{merge_result['offline_to_online_count']} alteracao(oes) offline enviada(s) ao online"
+            )
+        if merge_result["online_to_offline_count"] > 0:
+            message_parts.append(
+                f"{merge_result['online_to_offline_count']} alteracao(oes) online atualizada(s) no offline"
+            )
+        if merge_result["blocked_offline_changes"]:
+            message_parts.append(
+                _build_capacity_message(storage_status, len(merge_result["blocked_offline_changes"]))
+            )
+        if merge_result["conflicts"]:
+            message_parts.append(
+                _build_conflict_message(merge_result["conflicts"])
+            )
+        if not message_parts:
+            message_parts.append("Offline e online ja estavam alinhados.")
+
+        return {
+            "success": True,
+            "skipped": not (
+                merge_result["offline_to_online_count"]
+                or merge_result["online_to_offline_count"]
+            ),
+            "warning": bool(
+                merge_result["conflicts"] or merge_result["blocked_offline_changes"]
+            ),
+            "conflict": bool(merge_result["conflicts"]),
+            "message": ". ".join(message_parts),
+            "table_counts": table_counts,
+            "online_digest": persisted_state["online_digest"],
+            "local_digest": persisted_state["offline_digest"],
+            "sync_metadata_path": persisted_state["sync_metadata_path"],
+            "sync_baseline_path": persisted_state["sync_baseline_path"],
+            "mode": mode,
+            "synced_at": persisted_state["synced_at"],
+            "storage_status": storage_status,
+            "offline_to_online_count": merge_result["offline_to_online_count"],
+            "online_to_offline_count": merge_result["online_to_offline_count"],
+            "blocked_offline_to_online_count": len(merge_result["blocked_offline_changes"]),
+            "conflict_count": len(merge_result["conflicts"]),
+            "conflicts": merge_result["conflicts"],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "skipped": True,
+            "online_available": False,
+            "message": (
+                "Sem conexao valida com o Supabase. O banco offline local foi preservado "
+                "e sera reconciliado quando a conexao voltar."
+            ),
+            "error": str(exc),
+            "mode": mode,
+        }
+    finally:
+        if conn is not None:
+            release_thread_connection(project_root)
+
+
+def _empty_sync_payload():
+    return {table_name: [] for table_name in _SQLITE_SYNC_TABLES}
+
+
+def _default_sync_metadata():
+    return {
+        "version": 2,
+        "baseline": {
+            "digest": "",
+            "snapshot_path": "",
+            "last_updated_at": "",
+        },
+        "offline": {
+            "digest": "",
+            "base_online_digest": "",
+            "baseline_digest": "",
+            "last_source": "",
+            "last_synced_at": "",
+            "sqlite_path": "",
+            "sql_dump_path": "",
+        },
+        "online": {
+            "last_seen_digest": "",
+            "last_imported_digest": "",
+            "last_imported_at": "",
+            "last_exported_digest": "",
+            "last_exported_at": "",
+        },
+        "reconcile": {
+            "last_mode": "",
+            "last_attempt_at": "",
+            "last_status": "",
+            "last_conflict_count": 0,
+            "last_conflicts": [],
+            "last_blocked_offline_changes_count": 0,
+            "last_blocked_offline_changes": [],
+        },
+    }
+
+
+def _load_sync_metadata(project_root) -> dict:
+    metadata_path = get_sync_metadata_path(project_root).resolve()
+    if not metadata_path.exists():
+        return _default_sync_metadata()
+
+    try:
+        with metadata_path.open("r", encoding="utf-8") as metadata_file:
+            raw_metadata = json.load(metadata_file)
+    except Exception:
+        return _default_sync_metadata()
+
+    metadata = _default_sync_metadata()
+    if isinstance(raw_metadata, dict):
+        metadata["version"] = raw_metadata.get("version", metadata["version"])
+        if isinstance(raw_metadata.get("baseline"), dict):
+            metadata["baseline"].update(raw_metadata["baseline"])
+        if isinstance(raw_metadata.get("offline"), dict):
+            metadata["offline"].update(raw_metadata["offline"])
+        if isinstance(raw_metadata.get("online"), dict):
+            metadata["online"].update(raw_metadata["online"])
+        if isinstance(raw_metadata.get("reconcile"), dict):
+            metadata["reconcile"].update(raw_metadata["reconcile"])
+    return metadata
+
+
+def _save_sync_metadata(project_root, metadata: dict) -> None:
+    metadata_path = get_sync_metadata_path(project_root).resolve()
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8", newline="\n") as metadata_file:
+        json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+    temp_path.replace(metadata_path)
+
+
+def _load_sync_baseline_payload(project_root):
+    baseline_path = get_sync_baseline_path(project_root).resolve()
+    if not baseline_path.exists():
+        return _empty_sync_payload(), False
+
+    try:
+        with baseline_path.open("r", encoding="utf-8") as baseline_file:
+            raw_payload = json.load(baseline_file)
+    except Exception:
+        return _empty_sync_payload(), False
+
+    payload = _empty_sync_payload()
+    if isinstance(raw_payload, dict):
+        for table_name in _SQLITE_SYNC_TABLES:
+            table_rows = raw_payload.get(table_name)
+            if isinstance(table_rows, list):
+                payload[table_name] = _sort_rows_for_sync(table_rows)
+    return payload, True
+
+
+def _save_sync_baseline_payload(project_root, payload: dict) -> Path:
+    baseline_path = get_sync_baseline_path(project_root).resolve()
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = baseline_path.with_suffix(baseline_path.suffix + ".tmp")
+    normalized_payload = {
+        table_name: _sort_rows_for_sync(payload.get(table_name) or [])
+        for table_name in _SQLITE_SYNC_TABLES
+    }
+    with temp_path.open("w", encoding="utf-8", newline="\n") as baseline_file:
+        json.dump(normalized_payload, baseline_file, ensure_ascii=False, indent=2)
+    temp_path.replace(baseline_path)
+    return baseline_path
+
+
+def _payload_has_data(payload) -> bool:
+    return any(payload.get(table_name) for table_name in _SQLITE_SYNC_TABLES)
+
+
+def _get_current_sync_state(project_root, conn):
+    project_root = Path(project_root).resolve()
+    sqlite_path = get_database_path(project_root).resolve()
+    sqlite_exists = sqlite_path.exists()
+    local_payload = (
+        _dump_sqlite_sync_payload(sqlite_path, _SQLITE_SYNC_TABLES)
+        if sqlite_exists
+        else _empty_sync_payload()
+    )
+    online_payload = _dump_postgres_sync_payload(conn, _SQLITE_SYNC_TABLES)
+    baseline_payload, baseline_available = _load_sync_baseline_payload(project_root)
+    return {
+        "project_root": project_root,
+        "sqlite_path": sqlite_path,
+        "sqlite_exists": sqlite_exists,
+        "local_payload": local_payload,
+        "online_payload": online_payload,
+        "baseline_payload": baseline_payload,
+        "baseline_available": baseline_available,
+    }
+
+
+def _persist_sync_state(
+    project_root,
+    *,
+    baseline_payload,
+    offline_payload,
+    online_payload,
+    mode,
+    sqlite_path,
+    sql_dump_path,
+    import_applied,
+    export_applied,
+    conflicts,
+    blocked_offline_changes,
+    status,
+):
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    baseline_path = _save_sync_baseline_payload(project_root, baseline_payload)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    baseline_digest = _compute_sync_payload_digest(baseline_payload)
+    offline_digest = _compute_sync_payload_digest(offline_payload)
+    online_digest = _compute_sync_payload_digest(online_payload)
+
+    metadata["version"] = 2
+    metadata["baseline"] = {
+        "digest": baseline_digest,
+        "snapshot_path": str(baseline_path),
+        "last_updated_at": now_iso,
+    }
+    metadata["offline"] = {
+        "digest": offline_digest,
+        "base_online_digest": baseline_digest,
+        "baseline_digest": baseline_digest,
+        "last_source": mode,
+        "last_synced_at": now_iso,
+        "sqlite_path": str(sqlite_path or ""),
+        "sql_dump_path": str(sql_dump_path or ""),
+    }
+    metadata["online"] = {
+        **metadata.get("online", {}),
+        "last_seen_digest": online_digest,
+    }
+    if import_applied:
+        metadata["online"]["last_imported_digest"] = online_digest
+        metadata["online"]["last_imported_at"] = now_iso
+    if export_applied:
+        metadata["online"]["last_exported_digest"] = online_digest
+        metadata["online"]["last_exported_at"] = now_iso
+
+    trimmed_conflicts = _trim_sync_items_for_metadata(conflicts)
+    trimmed_blocked_items = _trim_sync_items_for_metadata(blocked_offline_changes)
+    metadata["reconcile"] = {
+        "last_mode": mode,
+        "last_attempt_at": now_iso,
+        "last_status": status,
+        "last_conflict_count": len(conflicts),
+        "last_conflicts": trimmed_conflicts,
+        "last_blocked_offline_changes_count": len(blocked_offline_changes),
+        "last_blocked_offline_changes": trimmed_blocked_items,
+    }
+    _save_sync_metadata(project_root, metadata)
+    return {
+        "synced_at": now_iso,
+        "baseline_digest": baseline_digest,
+        "offline_digest": offline_digest,
+        "online_digest": online_digest,
+        "sync_metadata_path": str(get_sync_metadata_path(project_root).resolve()),
+        "sync_baseline_path": str(baseline_path),
+    }
+
+
+def _trim_sync_items_for_metadata(items):
+    trimmed = []
+    for item in list(items or [])[:_SYNC_CONFLICT_METADATA_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        trimmed.append(
+            {
+                "table": str(item.get("table") or ""),
+                "item": str(item.get("item") or ""),
+                "identity": dict(item.get("identity") or {}),
+                "changed_columns": list(item.get("changed_columns") or []),
+                "reason": str(item.get("reason") or ""),
+            }
+        )
+    return trimmed
+
+
+def _get_online_storage_status(conn):
+    with conn.cursor(row_factory=dict_row) as cursor:
+        cursor.execute("SELECT pg_database_size(current_database()) AS size_bytes")
+        size_row = cursor.fetchone() or {}
+
+    limit_mb = 500.0
+    if _postgres_table_exists(conn, "constants"):
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT value_json FROM constants WHERE key = %s",
+                ("SUPABASE_DB_LIMIT_MB",),
+            )
+            constant_row = cursor.fetchone() or {}
+        raw_value_json = constant_row.get("value_json")
+        if raw_value_json:
+            try:
+                if isinstance(raw_value_json, (dict, list, int, float)):
+                    parsed_value = raw_value_json
+                else:
+                    parsed_value = json.loads(str(raw_value_json))
+                if isinstance(parsed_value, dict):
+                    parsed_value = parsed_value.get("value")
+                limit_mb = _normalize_sync_limit_mb(parsed_value, 500.0)
+            except Exception:
+                pass
+
+    used_mb = round(float(size_row.get("size_bytes") or 0) / (1024 * 1024), 2)
+    percent_used = round((used_mb / limit_mb) * 100, 2) if limit_mb else 0.0
+    if percent_used >= 90:
+        status = "high"
+    elif percent_used >= 70:
+        status = "warning"
+    else:
+        status = "normal"
+
+    return {
+        "used_mb": used_mb,
+        "limit_mb": limit_mb,
+        "percent_used": percent_used,
+        "status": status,
+        "storage_available_for_writes": percent_used < 100,
+        "online_available": True,
+    }
+
+
+def _normalize_sync_limit_mb(raw_value, fallback):
+    try:
+        normalized = float(raw_value)
+    except (TypeError, ValueError):
+        normalized = float(fallback)
+    if normalized <= 0:
+        normalized = float(fallback)
+    return round(normalized, 2)
+
+
+def _merge_sync_payloads(
+    baseline_payload,
+    offline_payload,
+    online_payload,
+    *,
+    allow_online_writes,
+):
+    final_online_payload = _empty_sync_payload()
+    final_offline_payload = _empty_sync_payload()
+    next_baseline_payload = _empty_sync_payload()
+    conflicts = []
+    blocked_offline_changes = []
+    offline_to_online_count = 0
+    online_to_offline_count = 0
+
+    for table_name in _SQLITE_SYNC_TABLES:
+        baseline_rows = _index_rows_by_identity(table_name, baseline_payload.get(table_name) or [])
+        offline_rows = _index_rows_by_identity(table_name, offline_payload.get(table_name) or [])
+        online_rows = _index_rows_by_identity(table_name, online_payload.get(table_name) or [])
+
+        resolved_online_rows = {}
+        resolved_offline_rows = {}
+        resolved_baseline_rows = {}
+
+        all_keys = sorted(
+            set(baseline_rows) | set(offline_rows) | set(online_rows),
+            key=lambda identity: _canonical_json_dumps(list(identity)),
+        )
+
+        for identity in all_keys:
+            baseline_row = baseline_rows.get(identity)
+            offline_row = offline_rows.get(identity)
+            online_row = online_rows.get(identity)
+
+            if offline_row == online_row:
+                _set_indexed_row(resolved_online_rows, identity, offline_row)
+                _set_indexed_row(resolved_offline_rows, identity, offline_row)
+                _set_indexed_row(resolved_baseline_rows, identity, offline_row)
+                continue
+
+            offline_changed = offline_row != baseline_row
+            online_changed = online_row != baseline_row
+
+            if offline_changed and not online_changed:
+                _set_indexed_row(resolved_offline_rows, identity, offline_row)
+                if allow_online_writes:
+                    _set_indexed_row(resolved_online_rows, identity, offline_row)
+                    _set_indexed_row(resolved_baseline_rows, identity, offline_row)
+                    offline_to_online_count += 1
+                else:
+                    _set_indexed_row(resolved_online_rows, identity, online_row)
+                    _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
+                    blocked_offline_changes.append(
+                        _build_sync_item_entry(
+                            table_name,
+                            identity,
+                            baseline_row,
+                            offline_row,
+                            online_row,
+                            reason="Sem espaco suficiente no online para aplicar esta alteracao offline agora.",
+                        )
+                    )
+                continue
+
+            if online_changed and not offline_changed:
+                _set_indexed_row(resolved_online_rows, identity, online_row)
+                _set_indexed_row(resolved_offline_rows, identity, online_row)
+                _set_indexed_row(resolved_baseline_rows, identity, online_row)
+                online_to_offline_count += 1
+                continue
+
+            if offline_changed and online_changed:
+                _set_indexed_row(resolved_online_rows, identity, online_row)
+                _set_indexed_row(resolved_offline_rows, identity, offline_row)
+                _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
+                conflicts.append(
+                    _build_sync_item_entry(
+                        table_name,
+                        identity,
+                        baseline_row,
+                        offline_row,
+                        online_row,
+                        reason=(
+                            "Mesmo item alterado online e offline desde a ultima base comum. "
+                            "Sugestao: verificar manualmente antes de forcar uma sincronizacao."
+                        ),
+                    )
+                )
+                continue
+
+            _set_indexed_row(resolved_online_rows, identity, online_row)
+            _set_indexed_row(resolved_offline_rows, identity, offline_row)
+            _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
+
+        final_online_payload[table_name] = _build_rows_from_identity_map(resolved_online_rows)
+        final_offline_payload[table_name] = _build_rows_from_identity_map(resolved_offline_rows)
+        next_baseline_payload[table_name] = _build_rows_from_identity_map(resolved_baseline_rows)
+
+    return {
+        "final_online_payload": final_online_payload,
+        "final_offline_payload": final_offline_payload,
+        "baseline_payload": next_baseline_payload,
+        "offline_to_online_count": offline_to_online_count,
+        "online_to_offline_count": online_to_offline_count,
+        "conflicts": conflicts,
+        "blocked_offline_changes": blocked_offline_changes,
+    }
+
+
+def _index_rows_by_identity(table_name, rows):
+    indexed_rows = {}
+    for row in rows or []:
+        identity = _row_identity_key(table_name, row)
+        indexed_rows[identity] = _normalize_row_for_sync(row)
+    return indexed_rows
+
+
+def _build_rows_from_identity_map(identity_map):
+    return _sort_rows_for_sync(identity_map.values())
+
+
+def _set_indexed_row(identity_map, identity, row):
+    if row is None:
+        identity_map.pop(identity, None)
+        return
+    identity_map[identity] = _normalize_row_for_sync(row)
+
+
+def _row_identity_key(table_name, row):
+    primary_keys = _SYNC_PRIMARY_KEYS[table_name]
+    normalized_row = _normalize_row_for_sync(row)
+    return tuple(normalized_row.get(key) for key in primary_keys)
+
+
+def _format_sync_item_label(table_name, identity):
+    primary_keys = _SYNC_PRIMARY_KEYS[table_name]
+    parts = []
+    for key_name, value in zip(primary_keys, identity):
+        parts.append(f"{key_name}={value}")
+    return f"{table_name}[{', '.join(parts)}]"
+
+
+def _build_sync_item_entry(table_name, identity, baseline_row, offline_row, online_row, *, reason):
+    primary_keys = _SYNC_PRIMARY_KEYS[table_name]
+    identity_dict = {
+        key_name: value
+        for key_name, value in zip(primary_keys, identity)
+    }
+    return {
+        "table": table_name,
+        "item": _format_sync_item_label(table_name, identity),
+        "identity": identity_dict,
+        "changed_columns": _detect_changed_columns(
+            baseline_row,
+            offline_row,
+            online_row,
+        ),
+        "reason": reason,
+    }
+
+
+def _detect_changed_columns(baseline_row, offline_row, online_row):
+    changed_columns = []
+    all_columns = sorted(
+        set((baseline_row or {}).keys())
+        | set((offline_row or {}).keys())
+        | set((online_row or {}).keys())
+    )
+    for column_name in all_columns:
+        baseline_value = (baseline_row or {}).get(column_name)
+        offline_value = (offline_row or {}).get(column_name)
+        online_value = (online_row or {}).get(column_name)
+        if offline_value != online_value or offline_value != baseline_value or online_value != baseline_value:
+            changed_columns.append(column_name)
+    return changed_columns
+
+
+def _build_conflict_message(conflicts):
+    listed_items = [conflict.get("item") for conflict in conflicts[:3] if conflict.get("item")]
+    message = (
+        f"Desincronizacao detectada em {len(conflicts)} item(ns) com alteracao online e offline no mesmo registro"
+    )
+    if listed_items:
+        message += f": {', '.join(listed_items)}"
+    return message + ". Sugestao: verificar antes de forcar Importar ou Exportar."
+
+
+def _build_capacity_message(storage_status, blocked_count):
+    return (
+        f"{blocked_count} alteracao(oes) offline ficaram pendentes porque o online esta com "
+        f"{storage_status.get('percent_used', 0)}% do limite configurado"
+    )
+
+
+def _canonical_json_dumps(payload) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _compute_sync_payload_digest(payload) -> str:
+    return hashlib.sha256(_canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _normalize_row_for_sync(row) -> dict:
+    normalized = {}
+    for key, value in dict(row).items():
+        normalized[str(key)] = value
+    return dict(sorted(normalized.items(), key=lambda item: item[0]))
+
+
+def _sort_rows_for_sync(rows) -> list[dict]:
+    normalized_rows = [_normalize_row_for_sync(row) for row in rows]
+    return sorted(normalized_rows, key=_canonical_json_dumps)
+
+
+def _dump_postgres_sync_payload(conn, table_names) -> dict[str, list[dict]]:
+    payload = _empty_sync_payload()
+    with conn.cursor(row_factory=dict_row) as cursor:
+        for table_name in table_names:
+            if not _postgres_table_exists(conn, table_name):
+                payload[table_name] = []
+                continue
+            cursor.execute(f"SELECT * FROM {_quote_identifier(table_name)}")
+            payload[table_name] = _sort_rows_for_sync(cursor.fetchall())
+    return payload
+
+
+def _dump_sqlite_sync_payload(sqlite_path: Path, table_names) -> dict[str, list[dict]]:
+    payload = _empty_sync_payload()
+    sqlite_conn = sqlite3.connect(str(sqlite_path))
+    sqlite_conn.row_factory = sqlite3.Row
+    try:
+        for table_name in table_names:
+            try:
+                rows = sqlite_conn.execute(
+                    f"SELECT * FROM {_quote_identifier(table_name)}"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                payload[table_name] = []
+                continue
+            payload[table_name] = _sort_rows_for_sync(rows)
+    finally:
+        sqlite_conn.close()
+    return payload
+
+
+def _write_sync_payload_to_sqlite_files(project_root, payload: dict):
+    project_root = Path(project_root).resolve()
+    database_dir = project_root / "database"
+    database_dir.mkdir(parents=True, exist_ok=True)
+
+    sqlite_path = get_database_path(project_root).resolve()
+    sql_dump_path = (database_dir / "app-offline-backup.sql").resolve()
+    temp_sqlite_path = (database_dir / "app.sqlite3.tmp").resolve()
+    temp_sql_dump_path = (database_dir / "app-offline-backup.sql.tmp").resolve()
+
+    for temp_path in (temp_sqlite_path, temp_sql_dump_path):
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    sqlite_conn = sqlite3.connect(str(temp_sqlite_path))
+    try:
+        sqlite_conn.execute("PRAGMA foreign_keys = OFF")
+        sqlite_conn.executescript(SCHEMA_SQL)
+        table_counts = _write_sync_payload_to_sqlite_connection(sqlite_conn, payload)
+        sqlite_conn.commit()
+        sqlite_conn.execute("VACUUM")
+        _write_sqlite_dump(sqlite_conn, temp_sql_dump_path)
+    except Exception:
+        try:
+            sqlite_conn.rollback()
+        except Exception:
+            pass
+        for temp_path in (temp_sqlite_path, temp_sql_dump_path):
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        sqlite_conn.close()
+
+    temp_sqlite_path.replace(sqlite_path)
+    temp_sql_dump_path.replace(sql_dump_path)
+    return {
+        "sqlite_path": str(sqlite_path),
+        "sql_dump_path": str(sql_dump_path),
+        "table_counts": table_counts,
+    }
+
+
+def _refresh_sql_dump_from_existing_sqlite(project_root) -> Path:
+    project_root = Path(project_root).resolve()
+    sqlite_path = get_database_path(project_root).resolve()
+    sql_dump_path = (project_root / "database" / "app-offline-backup.sql").resolve()
+    temp_sql_dump_path = (project_root / "database" / "app-offline-backup.sql.tmp").resolve()
+
+    sqlite_conn = sqlite3.connect(str(sqlite_path))
+    try:
+        _write_sqlite_dump(sqlite_conn, temp_sql_dump_path)
+    finally:
+        sqlite_conn.close()
+
+    temp_sql_dump_path.replace(sql_dump_path)
+    return sql_dump_path
+
+
+def _write_sync_payload_to_sqlite_connection(sqlite_conn, payload: dict) -> dict[str, int]:
+    table_counts = {}
+    for table_name in _SQLITE_SYNC_DELETE_ORDER:
+        sqlite_conn.execute(f"DELETE FROM {_quote_identifier(table_name)}")
+
+    for table_name in _SQLITE_SYNC_TABLES:
+        rows = list(payload.get(table_name) or [])
+        if not rows:
+            table_counts[table_name] = 0
+            continue
+
+        column_names = list(rows[0].keys())
+        quoted_columns = ", ".join(_quote_identifier(column) for column in column_names)
+        placeholders = ", ".join(["?"] * len(column_names))
+        sqlite_conn.executemany(
+            f"INSERT INTO {_quote_identifier(table_name)} ({quoted_columns}) VALUES ({placeholders})",
+            [tuple(row.get(column) for column in column_names) for row in rows],
+        )
+        table_counts[table_name] = len(rows)
+
+    return table_counts
+
+
+def _write_sync_payload_to_postgres(conn, payload: dict) -> dict[str, int]:
+    with conn.cursor(row_factory=dict_row) as cursor:
+        cursor.execute("BEGIN")
+        try:
+            for table_name in _SQLITE_SYNC_DELETE_ORDER:
+                if _postgres_table_exists(conn, table_name):
+                    cursor.execute(f"DELETE FROM {_quote_identifier(table_name)}")
+
+            table_counts = {}
+            for table_name in _SQLITE_SYNC_TABLES:
+                if not _postgres_table_exists(conn, table_name):
+                    table_counts[table_name] = 0
+                    continue
+
+                rows = list(payload.get(table_name) or [])
+                if not rows:
+                    table_counts[table_name] = 0
+                    continue
+
+                column_names = list(rows[0].keys())
+                quoted_columns = ", ".join(_quote_identifier(column) for column in column_names)
+                placeholders = ", ".join(["%s"] * len(column_names))
+                cursor.executemany(
+                    f"INSERT INTO {_quote_identifier(table_name)} ({quoted_columns}) VALUES ({placeholders})",
+                    [tuple(row.get(column) for column in column_names) for row in rows],
+                )
+                table_counts[table_name] = len(rows)
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    return table_counts
 
 
 class DatabaseCursorProxy:
@@ -798,6 +1889,51 @@ def _reset_identity_sequences(conn, tables: list[SQLiteTable]) -> None:
                         max_value > 0,
                     ),
                 )
+
+
+def _copy_postgres_to_sqlite(conn, sqlite_conn, table_names) -> dict[str, int]:
+    counts = {}
+
+    for table_name in table_names:
+        sqlite_columns = [
+            row[1]
+            for row in sqlite_conn.execute(
+                f'PRAGMA table_info("{str(table_name).replace(chr(34), chr(34) * 2)}")'
+            ).fetchall()
+        ]
+        if not sqlite_columns:
+            counts[str(table_name)] = 0
+            continue
+
+        sqlite_conn.execute(f'DELETE FROM {_quote_identifier(table_name)}')
+
+        if not _postgres_table_exists(conn, str(table_name)):
+            counts[str(table_name)] = 0
+            continue
+
+        quoted_columns = ", ".join(_quote_identifier(column) for column in sqlite_columns)
+        placeholders = ", ".join(["?"] * len(sqlite_columns))
+        rows = conn.execute(
+            f"SELECT {quoted_columns} FROM {_quote_identifier(table_name)}"
+        ).fetchall()
+
+        sqlite_conn.executemany(
+            f"INSERT INTO {_quote_identifier(table_name)} ({quoted_columns}) VALUES ({placeholders})",
+            (
+                tuple(row.get(column) for column in sqlite_columns)
+                for row in rows
+            ),
+        )
+        counts[str(table_name)] = len(rows)
+
+    sqlite_conn.commit()
+    return counts
+
+
+def _write_sqlite_dump(sqlite_conn, dump_path: Path) -> None:
+    with dump_path.open("w", encoding="utf-8", newline="\n") as dump_file:
+        for line in sqlite_conn.iterdump():
+            dump_file.write(f"{line}\n")
 
 
 def _collect_postgres_counts(conn, table_names=None) -> dict[str, int]:

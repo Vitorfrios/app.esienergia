@@ -1079,6 +1079,86 @@ class RoutesCore:
             print(f"Erro ao salvar system data: {str(e)}")
             return {"success": False, "error": str(e)}
 
+    def handle_post_import_online_to_offline(self, *, mode="manual-import", allow_unmanaged_local=True):
+        """Baixa o banco online para o snapshot offline local."""
+        try:
+            from servidor_modules.database.connection import (
+                SyncConflictError,
+                sync_postgres_to_sqlite,
+            )
+
+            result = sync_postgres_to_sqlite(
+                self.project_root,
+                mode=mode,
+                allow_unmanaged_local=allow_unmanaged_local,
+            )
+            print(" Importacao online -> offline concluida com sucesso")
+            return {
+                "success": True,
+                "message": (
+                    "Banco online importado para o fallback local em database/app.sqlite3 "
+                    "e dump SQL atualizado em database/app-offline-backup.sql."
+                ),
+                **result,
+            }
+        except SyncConflictError as e:
+            print(f"Conflito ao importar online -> offline: {str(e)}")
+            return {"success": False, "conflict": True, "error": str(e)}
+        except Exception as e:
+            print(f"Erro ao importar online -> offline: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+    def handle_post_export_offline_to_online(self):
+        """Envia o snapshot offline local para o banco online."""
+        try:
+            from servidor_modules.database.connection import (
+                SyncConflictError,
+                sync_sqlite_to_postgres,
+            )
+
+            result = sync_sqlite_to_postgres(
+                self.project_root,
+                mode="manual-export",
+            )
+            print(" Exportacao offline -> online concluida com sucesso")
+            return result
+        except SyncConflictError as e:
+            print(f"Conflito ao exportar offline -> online: {str(e)}")
+            return {"success": False, "conflict": True, "error": str(e)}
+        except Exception as e:
+            print(f"Erro ao exportar offline -> online: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+    def handle_post_reconcile_offline_online(self, *, mode="manual-reconcile"):
+        """Reconcilia alteracoes seguras entre offline local e banco online."""
+        try:
+            from servidor_modules.database.connection import reconcile_offline_and_online
+
+            result = reconcile_offline_and_online(
+                self.project_root,
+                mode=mode,
+            )
+            if result.get("success"):
+                print(" Reconciliacao offline <-> online concluida")
+            elif result.get("skipped"):
+                print(
+                    " Reconciliacao offline <-> online preservou o estado local:",
+                    result.get("message") or result.get("error"),
+                )
+            else:
+                print(
+                    " Falha na reconciliacao offline <-> online:",
+                    result.get("error") or result.get("message"),
+                )
+            return result
+        except Exception as e:
+            print(f"Erro ao reconciliar offline <-> online: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+    def handle_post_background_sync_offline(self):
+        """Atualiza discretamente o snapshot local apos salvar online."""
+        return self.handle_post_reconcile_offline_online(mode="background-save")
+
     def handle_post_save_constants(self, post_data):
         """Salva apenas as constantes"""
         try:

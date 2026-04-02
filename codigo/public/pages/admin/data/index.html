@@ -48,6 +48,14 @@
                     <i class="icon-save"></i> Salvar Tudo
                 </button>
 
+                <button class="btn btn-info" id="importOfflineDatabaseBtn" onclick="importOnlineToOffline()">
+                    <i class="icon-download"></i> Importar
+                </button>
+
+                <button class="btn btn-warning" id="exportOfflineDatabaseBtn" onclick="exportOfflineToOnline()">
+                    <i class="icon-upload"></i> Exportar
+                </button>
+
 
             </div>
         </div>
@@ -405,7 +413,7 @@
             <i class="fa-brands fa-github"></i> Vitor Rios on GitHub
         </a>
     </footer>
-    <script defer src="/public/dist/admin-data.min.js?v=20260325-20"></script>
+    <script defer src="/public/dist/admin-data.min.js?v=20260401-4"></script>
     <script>
         // Função para destacar e travar apenas o clique da página ativa
         function highlightAndLockActivePage() {

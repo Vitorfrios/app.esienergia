@@ -160,6 +160,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         "/api/system/database-size/vacuum-obras",
         "/api/system/storage-status",
         "/api/system/storage-status/reorganize",
+        "/api/system/offline/import",
+        "/api/system/offline/export",
+        "/api/system/offline/background-save",
+        "/api/system/offline/reconcile",
         "/system/database-size",
         "/system/database-size/tables",
         "/system/storage-status",
@@ -168,6 +172,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         "/api/empresas/all",
         "/api/machines/types",
         "/api/system-data/save",
+        "/api/system/offline/import",
+        "/api/system/offline/export",
+        "/api/system/offline/background-save",
+        "/api/system/offline/reconcile",
         "/api/constants/save",
         "/api/materials/save",
         "/api/empresas/save",
@@ -253,6 +261,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         # '/api/machines/type/{type}' é tratada separadamente no handle_machine_routes
         # ROTAS POST - SALVAMENTO DE DADOS
         "/api/system-data/save": "handle_post_save_system_data",
+        "/api/system/offline/import": "handle_post_import_online_to_offline",
+        "/api/system/offline/export": "handle_post_export_offline_to_online",
+        "/api/system/offline/background-save": "handle_post_background_sync_offline",
+        "/api/system/offline/reconcile": "handle_post_reconcile_offline_online",
         "/api/constants/save": "handle_post_save_constants",
         "/api/materials/save": "handle_post_save_materials",
         "/api/empresas/save": "handle_post_save_empresas",
@@ -1338,6 +1350,22 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         elif path == "/api/system/storage-status/reorganize":
             self.route_handler.handle_post_storage_reorganize(self)
             return  
+
+        elif path == "/api/system/offline/import":
+            self.route_handler.handle_post_import_online_to_offline(self)
+            return
+
+        elif path == "/api/system/offline/export":
+            self.route_handler.handle_post_export_offline_to_online(self)
+            return
+
+        elif path == "/api/system/offline/background-save":
+            self.route_handler.handle_post_background_sync_offline(self)
+            return
+
+        elif path == "/api/system/offline/reconcile":
+            self.route_handler.handle_post_reconcile_offline_online(self)
+            return
 
         elif path == "/api/constants/save":
             self.route_handler.handle_post_save_constants(self)
