@@ -88,7 +88,13 @@ export async function loadData() {
   try {
     showLoading("Carregando dados do sistema...");
 
-    const response = await fetch("/api/system-data");
+    const response = await fetch(`/api/system-data?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+      },
+    });
     if (!response.ok) {
       throw new Error(`Erro HTTP ${response.status}: ${response.statusText}`);
     }
@@ -251,6 +257,8 @@ function updateOfflineSyncButtonsState() {
   const available = isOfflineSyncAvailable();
   buttons.forEach((button) => {
     button.disabled = !available;
+    button.style.display = available ? "" : "none";
+    button.setAttribute("aria-hidden", available ? "false" : "true");
     button.title = available
       ? "Sincronizacao offline habilitada neste ambiente."
       : "Disponivel apenas fora do ambiente Render.";

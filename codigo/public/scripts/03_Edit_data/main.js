@@ -119,7 +119,13 @@ function ensureLoadDataFunction() {
     async function () {
       console.log("Carregando dados do sistema...");
 
-      const response = await fetch("/api/system-data");
+      const response = await fetch(`/api/system-data?t=${Date.now()}`, {
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+        },
+      });
       if (!response.ok) {
         throw new Error(`Erro ${response.status}: ${response.statusText}`);
       }
@@ -145,23 +151,36 @@ function refreshAdminArea() {
   initializeAdminCredentials();
 }
 
+function safeInvokeLoader(loaderName, loaderFn) {
+  if (typeof loaderFn !== "function") {
+    return;
+  }
+
+  try {
+    loaderFn();
+  } catch (error) {
+    console.error(` Falha ao atualizar modulo ${loaderName}:`, error);
+  }
+}
+
 function refreshChangedSections(changes = [], options = {}) {
   const normalizedChanges = Array.isArray(changes) ? changes : [];
   const refreshJsonEditor = options.refreshJsonEditor !== false;
   const refreshDashboard = options.refreshDashboard !== false;
 
   const loadersBySection = {
-    constants: () => window.loadConstants && window.loadConstants(),
+    constants: () => safeInvokeLoader("constants", window.loadConstants),
     machines: () => {
-      if (window.loadMachines) window.loadMachines();
-      if (window.filterMachines) window.filterMachines();
+      safeInvokeLoader("machines", window.loadMachines);
+      safeInvokeLoader("machines-filter", window.filterMachines);
     },
-    materials: () => window.loadMaterials && window.loadMaterials(),
-    empresas: () => window.loadEmpresas && window.loadEmpresas(),
-    banco_acessorios: () => window.loadAcessorios && window.loadAcessorios(),
-    dutos: () => window.loadDutos && window.loadDutos(),
-    tubos: () => window.loadTubos && window.loadTubos(),
-    ADM: () => initializeAdminCredentials(),
+    materials: () => safeInvokeLoader("materials", window.loadMaterials),
+    empresas: () => safeInvokeLoader("empresas", window.loadEmpresas),
+    banco_acessorios: () =>
+      safeInvokeLoader("acessorios", window.loadAcessorios),
+    dutos: () => safeInvokeLoader("dutos", window.loadDutos),
+    tubos: () => safeInvokeLoader("tubos", window.loadTubos),
+    ADM: () => safeInvokeLoader("admin-credentials", initializeAdminCredentials),
   };
 
   normalizedChanges.forEach((section) => {
@@ -172,12 +191,31 @@ function refreshChangedSections(changes = [], options = {}) {
   });
 
   if (refreshDashboard && normalizedChanges.length > 0) {
-    initializeDashboard();
+    safeInvokeLoader("dashboard", initializeDashboard);
   }
 
   if (refreshJsonEditor && window.loadJSONEditor) {
-    window.loadJSONEditor();
+    safeInvokeLoader("json-editor", window.loadJSONEditor);
   }
+}
+
+function refreshAllAdminViews() {
+  refreshChangedSections(
+    [
+      "constants",
+      "machines",
+      "materials",
+      "empresas",
+      "banco_acessorios",
+      "dutos",
+      "tubos",
+      "ADM",
+    ],
+    {
+      refreshJsonEditor: true,
+      refreshDashboard: true,
+    },
+  );
 }
 
 function hasUnsavedAdminDataChanges() {
@@ -694,18 +732,10 @@ window.addEventListener("dataLoaded", function (event) {
 
   // Carrega todos os componentes
   setTimeout(() => {
-    if (window.loadConstants) window.loadConstants();
-    if (window.loadMachines) window.loadMachines();
-    if (window.loadMaterials) window.loadMaterials();
-    if (window.loadEmpresas) window.loadEmpresas();
-    if (window.loadAcessorios) window.loadAcessorios();
-    if (window.loadDutos) window.loadDutos();
-    if (window.loadTubos) window.loadTubos();
-    if (window.filterMachines) window.filterMachines();
-    if (window.loadJSONEditor) window.loadJSONEditor();
+    refreshAllAdminViews();
 
     // Atualiza as novas abas
-    refreshAdminArea();
+    safeInvokeLoader("admin-area", refreshAdminArea);
 
     // Limpar staging
     window.stagingData = null;
@@ -825,7 +855,13 @@ window.reloadCompleteData = async function () {
 
   try {
     // Busca dados diretamente da API
-    const response = await fetch("/api/system-data");
+    const response = await fetch(`/api/system-data?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+      },
+    });
     if (response.ok) {
       const data = await response.json();
       console.log(" Dados da API:", {
