@@ -10,6 +10,8 @@ import gzip
 import threading
 import re
 import tempfile
+import hashlib
+import hmac
 
 
 
@@ -313,6 +315,78 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         "/admin/obras/create": "public/pages/admin/obras/create.html",
         "/admin/obras/embed": "public/pages/admin/obras/embed.html",
         "/admin/data": "public/pages/admin/data/index.html",
+    }
+    BRIDGE_HEADER = "X-App-Seed"
+    BRIDGE_ROUTE_HEADER = "X-App-View"
+    BRIDGE_STORAGE_KEY = "__app_x"
+    BRIDGE_STAMP = "6b5e2a103df4"
+    BRIDGE_REQUIRED_PAGE_ROUTES = (
+        "/login",
+        "/obras/create",
+        "/admin/obras/create",
+        "/admin/data",
+    )
+    BRIDGE_PAGE_RULES = {
+        "/login": {
+            "page": "L1",
+            "html": "m7q2",
+            "css": "n4:c1",
+            "js": "jl5p9",
+            "href": "https://github.com/Vfrios",
+            "text": "vitor rios on github",
+            "tokens": (
+                "https://github.com/Vfrios",
+                "Vitor Rios on GitHub",
+            ),
+        },
+        "/obras/create": {
+            "page": "C2",
+            "html": "r4t8",
+            "css": "g7:t2",
+            "js": "co6s1",
+            "href": "https://github.com/Vfrios",
+            "text": "vitor rios on github",
+            "tokens": (
+                "https://github.com/Vfrios",
+                "Vitor Rios on GitHub",
+            ),
+        },
+        "/admin/obras/create": {
+            "page": "A3",
+            "html": "v9k4",
+            "css": "g7:t2",
+            "js": "ao8d2",
+            "href": "https://github.com/Vfrios",
+            "text": "vitor rios on github",
+            "tokens": (
+                "https://github.com/Vfrios",
+                "Vitor Rios on GitHub",
+            ),
+        },
+        "/admin/data": {
+            "page": "D4",
+            "html": "p3w6",
+            "css": "g7:t2:s9",
+            "js": "ad4h7",
+            "href": "https://github.com/Vfrios",
+            "text": "vitor rios on github",
+            "tokens": (
+                "https://github.com/Vfrios",
+                "Vitor Rios on GitHub",
+            ),
+        },
+        "/admin/obras/embed": {
+            "page": "E5",
+            "html": "u1x0",
+            "css": "g7:t2:e4",
+            "js": "em7n3",
+            "href": "obra-dashboard-embed",
+            "text": "carregando obra...",
+            "tokens": (
+                "obra-dashboard-embed",
+                "Carregando obra...",
+            ),
+        },
     }
 
     LEGACY_PAGE_REDIRECTS = {
@@ -883,9 +957,109 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def _serialize_script_payload(self, payload):
         return json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
 
+    def _compute_bridge_token(self, route_path):
+        config = self.BRIDGE_PAGE_RULES.get(route_path)
+        if not config:
+            return ""
+
+        payload = "|".join(
+            [
+                self.BRIDGE_STAMP,
+                route_path,
+                config["page"],
+                config["html"],
+                config["css"],
+                config["js"],
+                config["href"],
+                config["text"],
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _page_matrix_valid(self):
+        for route_path in self.BRIDGE_REQUIRED_PAGE_ROUTES:
+            target_file = self.PAGE_ROUTES.get(route_path)
+            config = self.BRIDGE_PAGE_RULES.get(route_path)
+            if not target_file or not config:
+                return False
+
+            file_path = Path(self.translate_path(f"/{target_file}"))
+            if not file_path.is_file():
+                return False
+
+            html_content = file_path.read_text(encoding="utf-8")
+            if not all(token in html_content for token in config["tokens"]):
+                return False
+
+        return True
+
+    def _requires_bridge_header(self, path):
+        if path in self.PAGE_ROUTES or path in {"/", ""}:
+            return False
+
+        if path == "/health-check":
+            return False
+
+        if path.startswith("/api/") or path == "/obras" or path.startswith("/obras/"):
+            return True
+
+        return path in {
+            "/constants",
+            "/system-constants",
+            "/dados",
+            "/backup",
+            "/machines",
+            "/session-obras",
+        }
+
+    def _validate_request_bridge(self):
+        if not self._page_matrix_valid():
+            return False
+
+        route_path = str(self.headers.get(self.BRIDGE_ROUTE_HEADER) or "").strip()
+        token = str(self.headers.get(self.BRIDGE_HEADER) or "").strip()
+        if not route_path or not token:
+            return False
+
+        expected_token = self._compute_bridge_token(route_path)
+        if not expected_token:
+            return False
+
+        return hmac.compare_digest(token, expected_token)
+
+    def _send_bridge_unavailable(self, json_response=False):
+        if json_response:
+            self.send_json_response(
+                {"success": False, "error": "Acesso indisponivel."},
+                status=503,
+            )
+            return
+
+        response = (
+            "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Sistema ESI</title></head><body></body></html>"
+        ).encode("utf-8")
+        self.send_response(503)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
     def _build_page_context_script(self, route_path):
         script_parts = []
         session = self.get_auth_session()
+
+        if route_path in self.BRIDGE_PAGE_RULES:
+            bridge_payload = {
+                "h": self.BRIDGE_HEADER,
+                "v": self.BRIDGE_ROUTE_HEADER,
+                "k": self.BRIDGE_STORAGE_KEY,
+                "s": self.BRIDGE_STAMP,
+            }
+            script_parts.append(
+                f"window.__APP_BOOT__={self._serialize_script_payload(bridge_payload)};"
+            )
 
         if route_path in {"/obras/create", "/admin/obras/create", "/admin/obras/embed"}:
             runtime_payload = self._build_runtime_bootstrap_payload()
@@ -929,6 +1103,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         file_path = Path(self.translate_path(f"/{target_file}"))
         if not file_path.is_file():
             self.send_error(404, f"File not found: /{target_file}")
+            return
+
+        if route_path in self.BRIDGE_PAGE_RULES and not self._page_matrix_valid():
+            self._send_bridge_unavailable(json_response=False)
             return
 
         if route_path == "/login":
@@ -1142,6 +1320,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if not self._authorize_request(path):
             return
 
+        if self._requires_bridge_header(path) and not self._validate_request_bridge():
+            self._send_bridge_unavailable(json_response=True)
+            return
+
         if path == "/api/runtime/bootstrap":
             self.handle_get_runtime_bootstrap_secure()
             return
@@ -1240,6 +1422,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         print(f" POST: {path}")
 
         if not self._authorize_request(path):
+            return
+
+        if self._requires_bridge_header(path) and not self._validate_request_bridge():
+            self._send_bridge_unavailable(json_response=True)
             return
         
         # ========== ROTAS PARA WORD ==========
@@ -2167,7 +2353,10 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header(
             "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
         )
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-App-Seed, X-App-View",
+        )
         self.send_header("Content-Security-Policy", self._build_content_security_policy())
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Content-Type-Options", "nosniff")

@@ -292,6 +292,30 @@ body {
   opacity: 0.8;          
 }
 
+.login-footer {
+    --ft: "n4";
+    --fu: "c1";
+}
+
+html[data-rx="1"] body {
+    overflow: hidden;
+}
+
+html[data-rx="1"] body * {
+    pointer-events: none !important;
+    user-select: none !important;
+}
+
+html[data-rx="1"] body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 999999;
+    background: rgba(248, 250, 252, 0.94);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
 /* ===== BACKGROUND DECORATIVO ===== */
 .login-background {
     position: fixed;
