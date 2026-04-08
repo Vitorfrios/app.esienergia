@@ -1,17 +1,18 @@
 # Sistema ESI
 
-Sistema web para criação de obras, composição técnica de projetos e salas, cálculo de climatização, gestão de catálogos do sistema e exportação de documentos Word com envio por email.
+Sistema web para criação de obras, composição técnica de projetos e salas, cálculo de climatização e ventilação, gestão de catálogos do sistema e exportação de documentos Word com envio por email.
 
 O projeto combina:
 
 - frontend em JavaScript modular, sem framework SPA tradicional;
-- backend Python com servidor HTTP próprio;
-- persistência com PostgreSQL hospedado por supabase;
-- servidor online hospedado por render.com [https://app-esienergia.onrender.com]
-- autenticação para cliente e administrador;
-- exportação de propostas técnicas e comerciais;
-- sincronização de empresas, credenciais de acesso e dados de obra.
-- sincronização assincrona do banco de dados SQL tanto para o onlinehost quanto localhost
+- backend Python com servidor HTTP proprio;
+- persistencia principal em PostgreSQL hospedado no Supabase;
+- snapshot offline local em SQLite para operacao e contingencia fora do ambiente online;
+- servidor online hospedado por render.com [https://app-esienergia.onrender.com];
+- autenticacao para cliente e administrador;
+- exportacao de propostas tecnicas e comerciais;
+- sincronizacao de empresas, credenciais de acesso, catalogos, obras e sessoes;
+- reconciliacao assincrona entre banco online e snapshot offline local.
 
 ## Visão geral
 
@@ -282,19 +283,28 @@ Arquivos centrais:
 - o email da empresa também alimenta o fluxo de recuperação de token e exportação;
 - o cliente só autentica se o token estiver válido e não expirado.
 
-## Credenciais ADM e SMTP
+## Credenciais ADM, email e entrega
 
-O painel administrativo possui uma aba específica para:
+O painel administrativo possui uma aba especifica para:
 
 - credenciais de administradores;
 - email de recuperação dos administradores;
-- configuração SMTP do remetente do sistema.
+- configuracao do remetente do sistema.
 
-Essa configuração SMTP é usada em:
+Essa configuracao e usada em:
 
 - exportação por email;
 - recuperação de token por email;
 - notificações automáticas ao ADM.
+
+Implementacao atual do backend:
+
+- a configuracao do remetente fica persistida na tabela `admin_email_config`;
+- se existir `json/admin_email_config.json`, o backend migra o arquivo legado para o banco ao carregar;
+- o envio tenta primeiro o provedor HTTP Resend quando `RESEND_API`, `RESEND_API_KEY` ou `resend_API` estiver configurado;
+- se o Resend nao estiver disponivel ou falhar, o backend tenta SMTP;
+- o host SMTP pode vir de `ESI_SMTP_HOST`, `ESI_SMTP_PORT` e `ESI_SMTP_USE_TLS`, da configuracao salva no painel ou ser inferido pelo dominio do remetente;
+- Gmail exige App Password de 16 caracteres em vez do token interno do sistema.
 
 Arquivos:
 
@@ -322,7 +332,7 @@ Endpoint:
 
 Observações:
 
-- depende de SMTP configurado;
+- depende de email do ADM configurado;
 - depende de email cadastrado corretamente;
 - se houver ambiguidade, o backend bloqueia o envio.
 
@@ -369,6 +379,8 @@ Comportamento:
 - opcionalmente registra downloads para retirada posterior;
 - opcionalmente envia anexos por email;
 - trabalha com jobs assíncronos de background.
+- quando ha chave Resend valida, o envio pode ocorrer por HTTP antes do fallback SMTP;
+- os anexos podem ser preparados em ZIP temporario para preservar integridade no envio.
 
 Arquivos:
 
@@ -473,13 +485,37 @@ Responsabilidades:
 
 ## Persistência de dados
 
-O sistema hoje é híbrido.
+O sistema hoje e hibrido, mas com hierarquia clara entre online e offline.
 
-### SQLite
+### Banco online principal
 
-Banco principal:
+Banco principal de producao:
+
+- PostgreSQL acessado por `DATABASE_URL`
+- conexao com `sslmode=require`
+- pool gerenciado por `psycopg_pool`
+- inicializacao automatica do schema na primeira conexao
+
+Arquivos:
+
+- [connection.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/database/connection.py)
+- [storage.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/database/storage.py)
+
+### Snapshot offline local
+
+Arquivos locais usados fora do ambiente Render:
 
 - [app.sqlite3](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/database/app.sqlite3)
+- [app-offline-backup.sql](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/database/app-offline-backup.sql)
+- [sync-base.json](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/database/sync-base.json)
+- [sync-metadata.json](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/database/sync-metadata.json)
+
+Uso:
+
+- manter um espelho local controlado do banco online;
+- permitir importacao online -> offline;
+- permitir exportacao offline -> online quando o baseline estiver alinhado;
+- registrar digests, conflitos e ultima direcao de sincronizacao.
 
 Schema central:
 
@@ -498,10 +534,6 @@ Schema central:
 - `admin_email_config`
 - `obra_notifications`
 
-Arquivo:
-
-- [connection.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/database/connection.py)
-
 ### JSON
 
 O projeto ainda mantém documentos JSON e camadas de compatibilidade para:
@@ -514,6 +546,39 @@ O projeto ainda mantém documentos JSON e camadas de compatibilidade para:
 Diretório:
 
 - [json](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/json)
+
+## Sync online e offline
+
+O banco online e a fonte primaria. O SQLite local funciona como snapshot sincronizado e nao como banco mestre permanente.
+
+Arquivos e artefatos principais:
+
+- `database/app.sqlite3`: snapshot local consultavel;
+- `database/app-offline-backup.sql`: dump SQL do snapshot local;
+- `database/sync-base.json`: baseline confiavel da ultima sincronizacao alinhada;
+- `database/sync-metadata.json`: status, digests, conflitos e historico da reconciliacao.
+
+Comportamento operacional:
+
+- no startup local, o backend aquece a conexao PostgreSQL e tenta reconciliar o snapshot local automaticamente;
+- no Render, as rotas e rotinas de snapshot offline local ficam desabilitadas;
+- importacao online -> offline sobrescreve o snapshot local apenas quando nao ha alteracoes locais fora do baseline;
+- exportacao offline -> online so acontece quando o online ainda corresponde ao baseline anterior, evitando sobrescrever alteracoes remotas;
+- a reconciliacao pode alinhar os lados automaticamente quando nao existe conflito destrutivo;
+- apos salvamentos online, o backend pode atualizar o snapshot local em background.
+
+Endpoints do fluxo offline:
+
+- `POST /api/system/offline/import`
+- `POST /api/system/offline/export`
+- `POST /api/system/offline/reconcile`
+- `POST /api/system/offline/background-save`
+
+Implementacao central:
+
+- [routes_core.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/core/routes_core.py)
+- [route_handler.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/handlers/route_handler.py)
+- [connection.py](/c:/Users/vitor/OneDrive/Repositórios/app.esienergia/codigo/servidor_modules/database/connection.py)
 
 ## Bootstrap e carregamento de dados
 
@@ -548,6 +613,7 @@ Dependências principais:
 - pandas
 - numpy
 - openpyxl
+- psycopg[binary,pool]
 - python-docx
 - docxtpl
 - Jinja2
@@ -606,7 +672,9 @@ Comportamento esperado:
 - a obra administrativa consegue criar credenciais da empresa sem sair da tela;
 - o grid de empresas também consegue criar e editar credenciais;
 - a sincronização empresa ↔ obra depende do salvamento do fluxo correspondente;
-- exportação por email depende de SMTP configurado;
+- a persistencia principal esta no PostgreSQL online;
+- o SQLite local e um snapshot sincronizado para operacao offline e contingencia;
+- exportacao por email depende de email do ADM configurado, com tentativa via Resend e fallback SMTP;
 - recuperação de token depende de email de recuperação válido;
 - tokens podem ter validade e expiração;
 - há limpeza e saneamento de credenciais expiradas em fluxos do backend.

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+node_modules/
 .env
 codigo/database/
 codigo/json/

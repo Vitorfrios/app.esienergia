@@ -423,6 +423,19 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         finally:
             release_thread_connection(self.project_root)
 
+    def handle(self):
+        """Evita traceback quando o cliente fecha a aba no meio da resposta."""
+        try:
+            super().handle()
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError) as exc:
+            client_host, client_port = self.client_address[:2]
+            request_path = getattr(self, "path", "(rota desconhecida)")
+            print(
+                f"[CLIENTE DESCONECTADO] Aba do navegador fechada pelo usuario "
+                f"durante o carregamento: {request_path} "
+                f"({client_host}:{client_port}) - {exc}"
+            )
+
     @property
     def routes_core(self):
         """Inicialização preguiçosa do RoutesCore"""
