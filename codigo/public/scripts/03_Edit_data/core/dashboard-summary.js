@@ -255,6 +255,11 @@ function normalizeDatabaseUsage(payload) {
         message: String(payload?.message || 'Armazenamento funcionando normalmente.').trim(),
         explanation: String(payload?.explanation || '').trim(),
         update_note: String(payload?.update_note || '').trim(),
+        data_source_mode: String(payload?.data_source_mode || 'offline').trim().toLowerCase(),
+        data_source_label: String(payload?.data_source_label || '').trim(),
+        data_source_summary: String(payload?.data_source_summary || '').trim(),
+        database_label: String(payload?.database_label || '').trim(),
+        pending_sync_message: String(payload?.pending_sync_message || '').trim(),
         maintenance_available: payload?.maintenance_available !== false,
         maintenance_action_label: String(payload?.maintenance_action_label || 'Reorganizar espaco do banco').trim(),
         maintenance_message: String(payload?.maintenance_message || '').trim()
@@ -369,6 +374,16 @@ function hasLoadedSystemData(data) {
     );
 }
 
+function getBootstrapStorageStatus() {
+    const bootstrapPayload =
+        window.__SYSTEM_BOOTSTRAP__ && typeof window.__SYSTEM_BOOTSTRAP__ === 'object'
+            ? window.__SYSTEM_BOOTSTRAP__
+            : null;
+    return bootstrapPayload?.storage_status && typeof bootstrapPayload.storage_status === 'object'
+        ? bootstrapPayload.storage_status
+        : null;
+}
+
 async function fetchJson(url) {
     const response = await fetch(url, {
         cache: 'no-store',
@@ -389,7 +404,7 @@ async function fetchDashboardData() {
     const localSystemData = safeObject(window.systemData);
     let backupData = { obras: [] };
     let systemData = {};
-    let databaseUsage = normalizeDatabaseUsage(null);
+    let databaseUsage = normalizeDatabaseUsage(getBootstrapStorageStatus());
 
     if (hasLoadedSystemData(localSystemData)) {
         systemData = localSystemData;
@@ -402,10 +417,17 @@ async function fetchDashboardData() {
         }
     }
 
-    const [backupResult, usageResult] = await Promise.allSettled([
-        fetchJson('/api/obras/catalog'),
-        fetchJson(`${STORAGE_STATUS_ENDPOINT}?t=${Date.now()}`)
-    ]);
+    const requests = [fetchJson('/api/obras/catalog')];
+    const shouldRefreshStorageStatus = !getBootstrapStorageStatus();
+    if (shouldRefreshStorageStatus) {
+        requests.push(fetchJson(`${STORAGE_STATUS_ENDPOINT}?t=${Date.now()}`));
+    }
+
+    const settledResults = await Promise.allSettled(requests);
+    const backupResult = settledResults[0];
+    const usageResult = shouldRefreshStorageStatus
+        ? settledResults[1]
+        : { status: 'fulfilled', value: getBootstrapStorageStatus() };
 
     if (backupResult.status === 'fulfilled') {
         backupData = safeObject(backupResult.value);
@@ -937,6 +959,12 @@ function renderDatabaseUsageWidget(stats) {
     const databaseUsage = normalizeDatabaseUsage(stats.databaseUsage);
     const status = stats.databaseUsageStatus || getDatabaseUsageStatus(databaseUsage);
     const progressPercent = Math.max(0, Math.min(databaseUsage.percent_used, 100));
+    const sourceEyebrow = databaseUsage.data_source_mode === 'online'
+        ? 'Supabase'
+        : 'Base local';
+    const sourceTitle = databaseUsage.data_source_mode === 'online'
+        ? 'Database usage'
+        : 'Uso da base local';
     const statusBadgeClass = status.level === 'good'
         ? 'good'
         : status.level === 'attention'
@@ -947,12 +975,15 @@ function renderDatabaseUsageWidget(stats) {
         <section class="widget-card">
             <div class="widget-title-row">
                 <div>
-                    <span class="dashboard-eyebrow">Supabase</span>
-                    <h3>Database usage</h3>
+                    <span class="dashboard-eyebrow">${escapeHtml(sourceEyebrow)}</span>
+                    <h3>${escapeHtml(sourceTitle)}</h3>
                 </div>
                 <span class="info-badge ${statusBadgeClass}">
                     ${escapeHtml(status.label)}
                 </span>
+            </div>
+            <div class="muted-note" style="margin-bottom:10px;">
+                ${escapeHtml(databaseUsage.data_source_summary || databaseUsage.database_label || '')}
             </div>
             <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:10px;">
                 <div>
@@ -972,6 +1003,11 @@ function renderDatabaseUsageWidget(stats) {
             <div class="muted-note" style="margin-bottom:14px;">
                 ${escapeHtml(status.message)}
             </div>
+            ${databaseUsage.pending_sync_message ? `
+                <div class="muted-note" style="margin-bottom:14px; color:#b45309; font-weight:600;">
+                    ${escapeHtml(databaseUsage.pending_sync_message)}
+                </div>
+            ` : ''}
             <div class="muted-note" style="margin-bottom:8px;">
                 ${escapeHtml(databaseUsage.explanation)}
             </div>

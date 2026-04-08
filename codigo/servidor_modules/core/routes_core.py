@@ -15,6 +15,31 @@ from servidor_modules.database.repositories.machine_repository import MachineRep
 from servidor_modules.database.repositories.obra_repository import ObraRepository
 from servidor_modules.database.repositories.system_repository import SystemRepository
 
+_OFFLINE_SYNC_LOG_LOCK = threading.Lock()
+_OFFLINE_SYNC_LOG_MESSAGE = ""
+_OFFLINE_SYNC_LOG_AT = 0.0
+
+
+def _log_offline_sync_status_once(message, *, min_interval_seconds=30.0):
+    global _OFFLINE_SYNC_LOG_MESSAGE, _OFFLINE_SYNC_LOG_AT
+
+    normalized_message = str(message or "").strip()
+    if not normalized_message:
+        return
+
+    now = time.monotonic()
+    with _OFFLINE_SYNC_LOG_LOCK:
+        if (
+            normalized_message == _OFFLINE_SYNC_LOG_MESSAGE
+            and (now - _OFFLINE_SYNC_LOG_AT) < float(min_interval_seconds)
+        ):
+            return
+
+        _OFFLINE_SYNC_LOG_MESSAGE = normalized_message
+        _OFFLINE_SYNC_LOG_AT = now
+
+    print(normalized_message)
+
 
 class RoutesCore:
     """Núcleo das funcionalidades de rotas organizadas por categoria"""
@@ -929,6 +954,7 @@ class RoutesCore:
                 "message": self.system_repository.STORAGE_STATUS_MESSAGES["normal"],
                 "explanation": self.system_repository.STORAGE_EXPLANATION,
                 "update_note": self.system_repository.STORAGE_UPDATE_NOTE,
+                **self.system_repository._build_data_source_status_payload(),
             }
 
     def handle_get_storage_status(self):
@@ -945,6 +971,7 @@ class RoutesCore:
                 "message": self.system_repository.STORAGE_STATUS_MESSAGES["normal"],
                 "explanation": self.system_repository.STORAGE_EXPLANATION,
                 "update_note": self.system_repository.STORAGE_UPDATE_NOTE,
+                **self.system_repository._build_data_source_status_payload(),
             }
 
     def handle_get_database_table_usage(self):
@@ -1139,12 +1166,20 @@ class RoutesCore:
                 mode=mode,
             )
             if result.get("success"):
-                print(" Reconciliacao offline <-> online concluida")
-            elif result.get("skipped"):
-                print(
-                    " Reconciliacao offline <-> online preservou o estado local:",
-                    result.get("message") or result.get("error"),
+                _log_offline_sync_status_once(" Reconciliacao offline <-> online concluida")
+            elif result.get("storage_guard_active"):
+                _log_offline_sync_status_once(
+                    " Banco online com pouco espaco. Dados locais mantidos ate o uso cair para 80%."
                 )
+            elif result.get("manual_sync_required"):
+                _log_offline_sync_status_once(
+                    " Historico local restaurado. Use Exportar para sincronizar com o banco online."
+                )
+            elif result.get("skipped"):
+                if result.get("online_available"):
+                    _log_offline_sync_status_once(" Banco online disponivel. Dados locais mantidos.")
+                else:
+                    _log_offline_sync_status_once(" Banco online indisponivel. Dados locais mantidos.")
             else:
                 print(
                     " Falha na reconciliacao offline <-> online:",

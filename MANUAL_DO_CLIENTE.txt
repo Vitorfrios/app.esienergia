@@ -1,0 +1,53 @@
+MANUAL DO CLIENTE - ESI Energia
+
+1. Como instalar
+
+- Extraia o arquivo .zip recebido para uma pasta local.
+- Mantenha todos os arquivos extraídos juntos.
+- Não mova apenas o arquivo ESI-Energia.exe para fora da pasta.
+
+2. Como abrir o sistema
+
+- Abra a pasta ESI-Energia.
+- Execute o arquivo ESI-Energia.exe.
+- Aguarde a inicialização do servidor local.
+- O sistema pode abrir automaticamente no navegador.
+
+3. Se o navegador não abrir sozinho
+
+- Abra o navegador manualmente.
+- Acesse:
+  http://localhost:8000/admin/obras/create
+
+Se a porta 8000 estiver ocupada, o sistema pode usar outra porta automaticamente.
+
+4. Regras importantes
+
+- Não apague a pasta _internal.
+- Não altere manualmente os arquivos internos do sistema.
+- Não renomeie ou mova arquivos da pasta distribuída.
+- Se o Windows pedir permissão de execução, permita a abertura do aplicativo.
+
+5. Banco de dados e internet
+
+- O sistema trabalha com banco online.
+- Algumas funções dependem de conexão com a internet.
+- O modo offline local pode manter dados temporários conforme a configuração do sistema.
+
+6. Exportações e email
+
+- Exportações de documentos e envio de email dependem da configuração do sistema.
+- Caso alguma exportação falhe, feche e abra o sistema novamente antes de tentar de novo.
+
+7. Atualizações
+
+- Quando receber uma versão nova, substitua a pasta antiga pela nova versão completa.
+- Não copie apenas o arquivo .exe por cima da versão anterior.
+
+8. Suporte
+
+- Em caso de erro, envie para o suporte:
+  - uma descrição do problema
+  - prints da tela
+  - o horário aproximado do erro
+

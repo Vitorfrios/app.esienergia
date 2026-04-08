@@ -5,15 +5,28 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-from servidor_modules.database.connection import has_empresas_numero_cliente_column
+from servidor_modules.database.connection import (
+    has_empresas_numero_cliente_column,
+    mark_local_offline_change,
+    refresh_local_sql_dump,
+)
 from servidor_modules.database.storage import get_storage
 
 
 class ObraRepository:
     def __init__(self, project_root):
         self.storage = get_storage(project_root)
-        self.conn = self.storage.conn
         self.project_root = self.storage.project_root
+
+    @property
+    def conn(self):
+        self.storage.refresh_connection_mode()
+        return self.storage.conn
+
+    def _sync_local_offline_sidecars(self, source):
+        if getattr(self.conn, "is_sqlite", False):
+            refresh_local_sql_dump(self.project_root)
+            mark_local_offline_change(self.project_root, source=source)
 
     def _supports_numero_cliente_column(self):
         return has_empresas_numero_cliente_column(
@@ -56,6 +69,8 @@ class ObraRepository:
         except Exception:
             self.conn.rollback()
             raise
+
+        self._sync_local_offline_sidecars("obras:replace-backup")
 
         return self.get_backup_payload()
 
@@ -114,6 +129,7 @@ class ObraRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("obras:save")
         return obra
 
     def delete(self, obra_id):
@@ -133,6 +149,7 @@ class ObraRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("obras:delete")
 
     def get_by_session_ids(self, obra_ids):
         ordered_ids = [str(obra_id) for obra_id in obra_ids if str(obra_id).strip()]
@@ -152,30 +169,47 @@ class ObraRepository:
         return [obras_by_id[obra_id] for obra_id in ordered_ids if obra_id in obras_by_id]
 
     def get_next_numero_cliente(self, sigla):
-        if self._supports_numero_cliente_column():
-            row = self.conn.execute(
-                """
-                SELECT GREATEST(
-                    COALESCE(
-                        (
-                            SELECT ultimo_numero_cliente
-                            FROM empresas
-                            WHERE codigo = ?
+        supports_numero_cliente_column = self._supports_numero_cliente_column()
+        try:
+            if supports_numero_cliente_column:
+                row = self.conn.execute(
+                    """
+                    SELECT GREATEST(
+                        COALESCE(
+                            (
+                                SELECT ultimo_numero_cliente
+                                FROM empresas
+                                WHERE codigo = ?
+                            ),
+                            0
                         ),
-                        0
-                    ),
-                    COALESCE((
+                        COALESCE((
+                            SELECT COALESCE(numero_cliente_final, 0)
+                            FROM obras
+                            WHERE empresa_codigo = ?
+                            ORDER BY numero_cliente_final DESC NULLS LAST
+                            LIMIT 1
+                        ), 0)
+                    ) AS max_numero
+                    """,
+                    (str(sigla), str(sigla)),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """
+                    SELECT COALESCE((
                         SELECT COALESCE(numero_cliente_final, 0)
                         FROM obras
                         WHERE empresa_codigo = ?
                         ORDER BY numero_cliente_final DESC NULLS LAST
                         LIMIT 1
-                    ), 0)
-                ) AS max_numero
-                """,
-                (str(sigla), str(sigla)),
-            ).fetchone()
-        else:
+                    ), 0) AS max_numero
+                    """,
+                    (str(sigla),),
+                ).fetchone()
+        except Exception as exc:
+            if "ultimo_numero_cliente" not in str(exc):
+                raise
             row = self.conn.execute(
                 """
                 SELECT COALESCE((
@@ -189,7 +223,7 @@ class ObraRepository:
                 (str(sigla),),
             ).fetchone()
         max_numero = row["max_numero"] if row and row["max_numero"] is not None else 0
-        if not self._supports_numero_cliente_column():
+        if not supports_numero_cliente_column:
             max_numero = max(
                 int(max_numero),
                 self._get_empresa_numero_cliente_atual_from_json(str(sigla)),
@@ -250,10 +284,32 @@ class ObraRepository:
             self._sync_empresas_numero_cliente_json(cursor, codigos_normalizados)
             return
 
-        if codigos_normalizados:
-            placeholders = ", ".join(["?"] * len(codigos_normalizados))
+        try:
+            if codigos_normalizados:
+                placeholders = ", ".join(["?"] * len(codigos_normalizados))
+                cursor.execute(
+                    f"""
+                    UPDATE empresas AS empresas_destino
+                    SET ultimo_numero_cliente = GREATEST(
+                        COALESCE(empresas_destino.ultimo_numero_cliente, 0),
+                        COALESCE(obras_agrupadas.max_numero_cliente, 0)
+                    )
+                    FROM (
+                        SELECT
+                            empresa_codigo,
+                            MAX(COALESCE(numero_cliente_final, 0)) AS max_numero_cliente
+                        FROM obras
+                        WHERE empresa_codigo IN ({placeholders})
+                        GROUP BY empresa_codigo
+                    ) AS obras_agrupadas
+                    WHERE empresas_destino.codigo = obras_agrupadas.empresa_codigo
+                    """,
+                    tuple(codigos_normalizados),
+                )
+                return
+
             cursor.execute(
-                f"""
+                """
                 UPDATE empresas AS empresas_destino
                 SET ultimo_numero_cliente = GREATEST(
                     COALESCE(empresas_destino.ultimo_numero_cliente, 0),
@@ -264,33 +320,16 @@ class ObraRepository:
                         empresa_codigo,
                         MAX(COALESCE(numero_cliente_final, 0)) AS max_numero_cliente
                     FROM obras
-                    WHERE empresa_codigo IN ({placeholders})
+                    WHERE COALESCE(empresa_codigo, '') <> ''
                     GROUP BY empresa_codigo
                 ) AS obras_agrupadas
                 WHERE empresas_destino.codigo = obras_agrupadas.empresa_codigo
-                """,
-                tuple(codigos_normalizados),
+                """
             )
-            return
-
-        cursor.execute(
-            """
-            UPDATE empresas AS empresas_destino
-            SET ultimo_numero_cliente = GREATEST(
-                COALESCE(empresas_destino.ultimo_numero_cliente, 0),
-                COALESCE(obras_agrupadas.max_numero_cliente, 0)
-            )
-            FROM (
-                SELECT
-                    empresa_codigo,
-                    MAX(COALESCE(numero_cliente_final, 0)) AS max_numero_cliente
-                FROM obras
-                WHERE COALESCE(empresa_codigo, '') <> ''
-                GROUP BY empresa_codigo
-            ) AS obras_agrupadas
-            WHERE empresas_destino.codigo = obras_agrupadas.empresa_codigo
-            """
-        )
+        except Exception as exc:
+            if "ultimo_numero_cliente" not in str(exc):
+                raise
+            self._sync_empresas_numero_cliente_json(cursor, codigos_normalizados)
 
     def _get_empresa_numero_cliente_atual_from_json(self, codigo):
         row = self.conn.execute(

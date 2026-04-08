@@ -3,6 +3,10 @@ __pycache__/
 *.pyo
 *.pyd
 node_modules/
+build/
+dist/
+*.zip
+*.rar
 .env
 codigo/database/
 codigo/json/

@@ -11,6 +11,7 @@ import {
   hasRealChanges,
 } from "./state.js";
 import {
+  escapeHtml,
   showLoading,
   hideLoading,
   showSuccess,
@@ -111,6 +112,7 @@ export async function loadData() {
     window.dispatchEvent(new CustomEvent("dataLoaded", { detail: data }));
 
     clearPendingChanges();
+    refreshSystemStatus();
     showSuccess("Dados carregados com sucesso!");
   } catch (error) {
     console.error("Erro ao carregar dados:", error);
@@ -187,6 +189,7 @@ export async function saveData(options = {}) {
       updateOriginalData(systemData);
 
       clearPendingChanges();
+      refreshSystemStatus();
       if (!silent) {
         showSuccess(result.message || "Dados salvos com sucesso!");
       }
@@ -199,7 +202,6 @@ export async function saveData(options = {}) {
           }
         })
       );
-      backgroundSyncOfflineAfterSave();
       return {
         success: true,
         changedSections,
@@ -269,6 +271,11 @@ let offlineReconcileInFlight = false;
 let offlineReconnectMonitorStarted = false;
 let lastOfflineConflictSignature = "";
 let lastOfflineCapacitySignature = "";
+let lastOfflineStatusMessage = "";
+let systemStatusRefreshInFlight = null;
+let lastSystemStatusPayload = null;
+let lastSystemStatusFetchedAt = 0;
+const SYSTEM_STATUS_CACHE_MS = 1500;
 
 async function callOfflineSyncEndpoint(endpoint, { silent = false } = {}) {
   const response = await fetch(endpoint, {
@@ -298,9 +305,439 @@ async function callOfflineSyncEndpoint(endpoint, { silent = false } = {}) {
 
 function buildOfflineConflictSignature(conflicts) {
   return (conflicts || [])
-    .map((item) => `${item.table || ""}:${item.item || ""}`)
+    .map((item) =>
+      JSON.stringify({
+        table: item?.table || "",
+        item: item?.item || "",
+        fields: Array.isArray(item?.field_conflicts)
+          ? item.field_conflicts.map((field) => ({
+              field: field?.field || "",
+              offlineHasValue: Boolean(field?.offline_has_value),
+              offlineValue: field?.offline_value ?? null,
+              onlineHasValue: Boolean(field?.online_has_value),
+              onlineValue: field?.online_value ?? null,
+            }))
+          : [],
+      }),
+    )
     .sort()
     .join("|");
+}
+
+function getOfflineConflictFieldCount(conflicts) {
+  return (conflicts || []).reduce((total, item) => {
+    const fieldConflicts = Array.isArray(item?.field_conflicts)
+      ? item.field_conflicts.length
+      : 0;
+    return total + fieldConflicts;
+  }, 0);
+}
+
+function ensureOfflineConflictModalStyles() {
+  if (document.getElementById("offlineConflictModalStyles")) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = "offlineConflictModalStyles";
+  style.textContent = `
+    .offline-conflict-modal {
+      max-width: min(1100px, 96vw);
+      max-height: min(88vh, 900px);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background: #ffffff;
+      color: #1f2937;
+    }
+
+    .offline-conflict-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .offline-conflict-header h3 {
+      margin: 0 0 0.35rem;
+    }
+
+    .offline-conflict-header p {
+      margin: 0;
+      color: #475569;
+      line-height: 1.5;
+    }
+
+    .offline-conflict-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+
+    .offline-conflict-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.45rem 0.8rem;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    .offline-conflict-list {
+      overflow: auto;
+      padding-right: 0.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .offline-conflict-card {
+      border: 1px solid #dbeafe;
+      border-radius: 16px;
+      padding: 1rem;
+      background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+    }
+
+    .offline-conflict-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .offline-conflict-card-header h4 {
+      margin: 0 0 0.35rem;
+      font-size: 1rem;
+    }
+
+    .offline-conflict-card-header p {
+      margin: 0;
+      color: #475569;
+      line-height: 1.45;
+    }
+
+    .offline-conflict-badge {
+      padding: 0.35rem 0.65rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      background: #fff7ed;
+      color: #c2410c;
+      white-space: nowrap;
+    }
+
+    .offline-conflict-merged {
+      margin: 0 0 0.9rem;
+      color: #166534;
+      font-size: 0.9rem;
+    }
+
+    .offline-conflict-table-wrap {
+      overflow-x: auto;
+    }
+
+    .offline-conflict-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 720px;
+    }
+
+    .offline-conflict-table th,
+    .offline-conflict-table td {
+      padding: 0.8rem;
+      border-bottom: 1px solid #e5e7eb;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    .offline-conflict-table th {
+      background: #eff6ff;
+      color: #1e3a8a;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .offline-conflict-value {
+      display: inline-flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      align-items: flex-start;
+    }
+
+    .offline-conflict-value code {
+      display: inline-block;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 0.55rem 0.65rem;
+      border-radius: 10px;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      max-width: 320px;
+    }
+
+    .offline-conflict-empty {
+      color: #64748b;
+      font-style: italic;
+    }
+
+    .offline-conflict-action-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.28rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+
+    .offline-conflict-action-tag.export {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .offline-conflict-action-tag.import {
+      background: #dbeafe;
+      color: #1d4ed8;
+    }
+
+    .offline-conflict-action-copy {
+      color: #475569;
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+
+    @media (max-width: 768px) {
+      .offline-conflict-modal {
+        width: 96vw;
+        max-height: 94vh;
+        padding: 1rem;
+      }
+
+      .offline-conflict-header,
+      .offline-conflict-card-header {
+        flex-direction: column;
+      }
+
+      .offline-conflict-table {
+        min-width: 620px;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function stringifyOfflineConflictValue(value, hasValue) {
+  if (!hasValue) {
+    return '<span class="offline-conflict-empty">Sem valor</span>';
+  }
+
+  if (value === null) {
+    return "<code>null</code>";
+  }
+
+  if (typeof value === "object") {
+    const jsonValue = JSON.stringify(value);
+    const limitedValue =
+      jsonValue && jsonValue.length > 220
+        ? `${jsonValue.slice(0, 220)}...`
+        : jsonValue || "{}";
+    return `<code>${escapeHtml(limitedValue)}</code>`;
+  }
+
+  const stringValue = String(value);
+  const limitedValue =
+    stringValue.length > 220 ? `${stringValue.slice(0, 220)}...` : stringValue;
+  return `<code>${escapeHtml(limitedValue)}</code>`;
+}
+
+function formatOfflineConflictFieldLabel(fieldName) {
+  const normalized = String(fieldName || "")
+    .replace(/^raw_json\./, "")
+    .replace(/^value_json\./, "")
+    .replace(/^payload_json\./, "")
+    .replace(/^credenciais_json\./, "credenciais.")
+    .replace(/\./g, " > ");
+  return normalized || "Campo";
+}
+
+function renderOfflineConflictFieldRows(conflict) {
+  const fieldConflicts = Array.isArray(conflict?.field_conflicts)
+    ? conflict.field_conflicts
+    : [];
+
+  if (fieldConflicts.length === 0) {
+    return `
+      <tr>
+        <td colspan="4" class="offline-conflict-action-copy">
+          Este registro precisa de revisao manual completa antes da sincronizacao.
+        </td>
+      </tr>
+    `;
+  }
+
+  return fieldConflicts
+    .map((fieldConflict) => {
+      const recommendedAction =
+        fieldConflict?.recommended_action === "import" ? "import" : "export";
+      const recommendedText =
+        recommendedAction === "import"
+          ? "Importar o valor online para o computador"
+          : "Exportar o valor offline para o banco online";
+
+      return `
+        <tr>
+          <td><strong>${escapeHtml(formatOfflineConflictFieldLabel(fieldConflict?.field))}</strong></td>
+          <td>
+            <div class="offline-conflict-value">
+              ${stringifyOfflineConflictValue(
+                fieldConflict?.offline_value,
+                Boolean(fieldConflict?.offline_has_value),
+              )}
+              <span class="offline-conflict-action-tag export">Exportar</span>
+            </div>
+          </td>
+          <td>
+            <div class="offline-conflict-value">
+              ${stringifyOfflineConflictValue(
+                fieldConflict?.online_value,
+                Boolean(fieldConflict?.online_has_value),
+              )}
+              <span class="offline-conflict-action-tag import">Importar</span>
+            </div>
+          </td>
+          <td class="offline-conflict-action-copy">
+            <strong>${escapeHtml(recommendedText)}</strong><br>
+            ${escapeHtml(
+              fieldConflict?.baseline_has_value
+                ? "A ultima base comum tinha outro valor para este campo."
+                : "Este campo ainda nao tinha uma base comum entre online e offline.",
+            )}
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+function renderOfflineConflictCards(conflicts) {
+  return (conflicts || [])
+    .map((conflict, index) => {
+      const fieldCount = Array.isArray(conflict?.field_conflicts)
+        ? conflict.field_conflicts.length
+        : 0;
+      const autoMerged = Array.isArray(conflict?.auto_merged_columns)
+        ? conflict.auto_merged_columns
+        : [];
+
+      return `
+        <section class="offline-conflict-card">
+          <div class="offline-conflict-card-header">
+            <div>
+              <h4>${escapeHtml(conflict?.item || `Registro ${index + 1}`)}</h4>
+              <p>${escapeHtml(
+                conflict?.reason ||
+                  "O sistema preservou os valores offline e online para evitar perda de dados.",
+              )}</p>
+            </div>
+            <span class="offline-conflict-badge">
+              ${fieldCount > 0 ? `${fieldCount} campo(s) em sobreposicao` : "Revisao manual"}
+            </span>
+          </div>
+          ${
+            autoMerged.length > 0
+              ? `<p class="offline-conflict-merged">Campos sincronizados automaticamente: ${escapeHtml(autoMerged.map(formatOfflineConflictFieldLabel).join(", "))}.</p>`
+              : ""
+          }
+          <div class="offline-conflict-table-wrap">
+            <table class="offline-conflict-table">
+              <thead>
+                <tr>
+                  <th>Campo</th>
+                  <th>Valor offline</th>
+                  <th>Valor online</th>
+                  <th>Acao recomendada</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${renderOfflineConflictFieldRows(conflict)}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      `;
+    })
+    .join("");
+}
+
+function openOfflineConflictModal(conflicts) {
+  const modal = document.getElementById("offlineConflictModal");
+  const content = document.getElementById("offlineConflictModalContent");
+  if (!modal || !content) {
+    return;
+  }
+
+  ensureOfflineConflictModalStyles();
+
+  const conflictCount = (conflicts || []).length;
+  const fieldCount = getOfflineConflictFieldCount(conflicts);
+  content.innerHTML = `
+    <div class="offline-conflict-header">
+      <div>
+        <h3>Sobreposicao de sincronizacao</h3>
+        <p>
+          O sistema ja juntou automaticamente os campos que nao colidiam.
+          Os itens abaixo precisam de decisao manual para concluir a sincronizacao.
+        </p>
+      </div>
+      <button class="btn btn-secondary btn-small" type="button" onclick="closeOfflineConflictModal()">
+        Fechar
+      </button>
+    </div>
+    <div class="offline-conflict-summary">
+      <span class="offline-conflict-pill">${conflictCount} registro(s) com revisao</span>
+      <span class="offline-conflict-pill">${fieldCount} campo(s) em sobreposicao</span>
+      <span class="offline-conflict-pill">Recomendacao padrao: Exportar valor offline</span>
+    </div>
+    <div class="offline-conflict-list">
+      ${renderOfflineConflictCards(conflicts)}
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-info" type="button" onclick="runOfflineConflictSync('import')">
+        Importar valores online
+      </button>
+      <button class="btn btn-warning" type="button" onclick="runOfflineConflictSync('export')">
+        Exportar valores offline
+      </button>
+      <button class="btn btn-secondary" type="button" onclick="closeOfflineConflictModal()">
+        Decidir depois
+      </button>
+    </div>
+  `;
+  modal.style.display = "flex";
+}
+
+function closeOfflineConflictModal() {
+  const modal = document.getElementById("offlineConflictModal");
+  if (modal) {
+    modal.style.display = "none";
+  }
+}
+
+async function runOfflineConflictSync(action) {
+  closeOfflineConflictModal();
+  if (action === "import") {
+    return importOnlineToOffline();
+  }
+  return exportOfflineToOnline();
 }
 
 function notifyOfflineReconcileWarnings(result) {
@@ -308,18 +745,21 @@ function notifyOfflineReconcileWarnings(result) {
   const conflictSignature = buildOfflineConflictSignature(conflicts);
   if (conflicts.length > 0 && conflictSignature !== lastOfflineConflictSignature) {
     lastOfflineConflictSignature = conflictSignature;
+    const fieldCount = getOfflineConflictFieldCount(conflicts);
     const listedItems = conflicts
       .slice(0, 3)
       .map((item) => item.item)
       .filter(Boolean)
       .join(", ");
     const warningMessage = listedItems
-      ? `Desincronizacao detectada em ${conflicts.length} item(ns): ${listedItems}. Sugestao: verificar antes de sincronizar manualmente.`
-      : `Desincronizacao detectada em ${conflicts.length} item(ns). Sugestao: verificar antes de sincronizar manualmente.`;
+      ? `Foram encontrados ${fieldCount || conflicts.length} campo(s) com sobreposicao em ${conflicts.length} item(ns): ${listedItems}. Revise e escolha Importar ou Exportar.`
+      : `Foram encontrados ${fieldCount || conflicts.length} campo(s) com sobreposicao. Revise e escolha Importar ou Exportar.`;
     showWarning(warningMessage);
+    openOfflineConflictModal(conflicts);
     console.warn(" Itens com dupla modificacao online/offline:", conflicts);
   } else if (conflicts.length === 0) {
     lastOfflineConflictSignature = "";
+    closeOfflineConflictModal();
   }
 
   const blockedCount = Number(result?.blocked_offline_to_online_count || 0);
@@ -332,6 +772,159 @@ function notifyOfflineReconcileWarnings(result) {
   } else if (blockedCount === 0) {
     lastOfflineCapacitySignature = "";
   }
+}
+
+function resolveFriendlyOfflineSyncMessage(result) {
+  if (!result || typeof result !== "object") {
+    return "Nao foi possivel concluir a sincronizacao agora.";
+  }
+
+  if (result.manual_sync_required || result.failure_stage === "manual-sync-required") {
+    return "Historico restaurado, usando dados offline. Recomendado exportar para sincronizar.";
+  }
+
+  if (result.storage_guard_active || result.failure_stage === "storage-guard") {
+    return (
+      result.message ||
+      "Banco online com pouco espaco. Sistema usando base local ate o uso cair para 80%."
+    );
+  }
+
+  if (result.failure_stage === "connect-online" || result.online_available === false) {
+    return "Banco online indisponivel. Sistema usando o banco local no momento.";
+  }
+
+  if (result.failure_stage === "reconcile-runtime") {
+    return "Banco online disponivel. Sistema usando o banco local no momento.";
+  }
+
+  if (result.success && result.skipped) {
+    return "Seus dados ja estavam atualizados entre a copia local e o banco online.";
+  }
+
+  if (result.success) {
+    return result.message || "Sincronizacao concluida com sucesso.";
+  }
+
+  if (result.skipped) {
+    return (
+      result.message ||
+      "A sincronizacao nao precisou alterar seus dados locais neste momento."
+    );
+  }
+
+  return result.message || result.error || "Nao foi possivel concluir a sincronizacao agora.";
+}
+
+function applySystemStatusPayload(payload) {
+  const badge = document.getElementById("systemStatusBadge");
+  const text = document.getElementById("systemStatusText");
+  const notice = document.getElementById("offlineSyncNotice");
+
+  if (!badge || !text || !notice || !payload || typeof payload !== "object") {
+    return;
+  }
+
+  const mode = payload.data_source_mode === "online" ? "online" : "offline";
+  const summary =
+    payload.data_source_summary ||
+    (mode === "online"
+      ? "Sistema usando base online."
+      : "Sistema usando base local.");
+
+  badge.classList.remove("online", "offline");
+  badge.classList.add(mode);
+  text.textContent = summary;
+
+  const pendingMessage = String(payload.pending_sync_message || "").trim();
+  if (pendingMessage) {
+    notice.textContent = pendingMessage;
+    notice.style.display = "";
+  } else {
+    notice.textContent = "";
+    notice.style.display = "none";
+  }
+}
+
+function applyBootstrapSystemStatus() {
+  const bootstrapPayload =
+    window.__SYSTEM_BOOTSTRAP__ && typeof window.__SYSTEM_BOOTSTRAP__ === "object"
+      ? window.__SYSTEM_BOOTSTRAP__
+      : null;
+
+  const storageStatus = bootstrapPayload?.storage_status;
+  if (storageStatus && typeof storageStatus === "object") {
+    applySystemStatusPayload(storageStatus);
+    return true;
+  }
+
+  return false;
+}
+
+async function refreshSystemStatus() {
+  const now = Date.now();
+  if (systemStatusRefreshInFlight) {
+    return systemStatusRefreshInFlight;
+  }
+
+  if (lastSystemStatusPayload && now - lastSystemStatusFetchedAt < SYSTEM_STATUS_CACHE_MS) {
+    applySystemStatusPayload(lastSystemStatusPayload);
+    return lastSystemStatusPayload;
+  }
+
+  try {
+    systemStatusRefreshInFlight = fetch(`/api/system/storage-status?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+      },
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Erro HTTP ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((payload) => {
+        lastSystemStatusPayload = payload;
+        lastSystemStatusFetchedAt = Date.now();
+        if (window.__SYSTEM_BOOTSTRAP__ && typeof window.__SYSTEM_BOOTSTRAP__ === "object") {
+          window.__SYSTEM_BOOTSTRAP__.storage_status = payload;
+        }
+        applySystemStatusPayload(payload);
+        return payload;
+      })
+      .finally(() => {
+        systemStatusRefreshInFlight = null;
+      });
+
+    return await systemStatusRefreshInFlight;
+  } catch (error) {
+    console.warn(" Falha ao atualizar status do sistema:", error);
+    systemStatusRefreshInFlight = null;
+    return null;
+  }
+}
+
+function notifyOfflineStatusMessage(result) {
+  const friendlyMessage = resolveFriendlyOfflineSyncMessage(result);
+  const manualSyncRequired =
+    result?.manual_sync_required || result?.failure_stage === "manual-sync-required";
+  const shouldNotify =
+    friendlyMessage &&
+    friendlyMessage !== lastOfflineStatusMessage &&
+    (manualSyncRequired ||
+      result?.failure_stage === "connect-online" ||
+      result?.failure_stage === "reconcile-runtime");
+
+  if (!shouldNotify) {
+    return;
+  }
+
+  lastOfflineStatusMessage = friendlyMessage;
+  showInfo(friendlyMessage);
+  refreshSystemStatus();
 }
 
 async function reconcileOfflineAndOnline({
@@ -353,19 +946,16 @@ async function reconcileOfflineAndOnline({
   try {
     const result = await callOfflineSyncEndpoint(endpoint, { silent: true });
     notifyOfflineReconcileWarnings(result);
+    notifyOfflineStatusMessage(result);
+    refreshSystemStatus();
 
     if (result?.success) {
-      console.log(
-        result?.message || " Reconciliacao offline/online executada com sucesso.",
-      );
+      console.log(resolveFriendlyOfflineSyncMessage(result));
       return result;
     }
 
     if (result?.skipped) {
-      console.info(
-        result?.message ||
-          " Reconciliacao offline/online preservou o estado local.",
-      );
+      console.info(resolveFriendlyOfflineSyncMessage(result));
       return result;
     }
 
@@ -383,9 +973,11 @@ async function reconcileOfflineAndOnline({
 }
 
 async function backgroundSyncOfflineAfterSave() {
-  return reconcileOfflineAndOnline({
-    endpoint: "/api/system/offline/background-save",
-  });
+  return {
+    success: true,
+    skipped: true,
+    message: "Sincronizacao automatica desativada. Use Importar ou Exportar manualmente.",
+  };
 }
 
 export async function importOnlineToOffline() {
@@ -418,6 +1010,9 @@ export async function importOnlineToOffline() {
       showInfo("Copia de seguranca de dados local atualizada com sucesso.");
     }
 
+    refreshSystemStatus();
+    await loadData();
+
     return result;
   } catch (error) {
     console.error("Erro ao importar online para offline:", error);
@@ -439,6 +1034,7 @@ export async function exportOfflineToOnline() {
     }
 
     showSuccess(result.message || "Banco offline exportado com sucesso.");
+    refreshSystemStatus();
     await loadData();
     return result;
   } catch (error) {
@@ -450,26 +1046,27 @@ export async function exportOfflineToOnline() {
   }
 }
 
+window.closeOfflineConflictModal = closeOfflineConflictModal;
+window.runOfflineConflictSync = runOfflineConflictSync;
+
 function startOfflineReconnectMonitor() {
   if (!isOfflineSyncAvailable() || offlineReconnectMonitorStarted) {
     return;
   }
 
   offlineReconnectMonitorStarted = true;
+  let onlineRecoveryChecked = false;
 
   const triggerReconcile = () => {
+    if (onlineRecoveryChecked) {
+      return;
+    }
+    onlineRecoveryChecked = true;
     reconcileOfflineAndOnline();
   };
 
   window.addEventListener("online", triggerReconcile);
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) {
-      triggerReconcile();
-    }
-  });
-
   setTimeout(triggerReconcile, 2000);
-  window.setInterval(triggerReconcile, 60000);
 }
 
 // Função para corrigir dados automaticamente
@@ -611,5 +1208,8 @@ window.importOnlineToOffline = importOnlineToOffline;
 window.exportOfflineToOnline = exportOfflineToOnline;
 window.addEventListener("DOMContentLoaded", () => {
   updateOfflineSyncButtonsState();
+  if (!applyBootstrapSystemStatus()) {
+    refreshSystemStatus();
+  }
   startOfflineReconnectMonitor();
 });

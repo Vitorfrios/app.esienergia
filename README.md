@@ -638,6 +638,28 @@ Comportamento esperado:
 - se necessário, tenta liberar a porta ou escolher outra;
 - abre o navegador automaticamente em `/admin/obras/create`.
 
+### Geração do executável
+
+O executável Windows é gerado a partir dos arquivos-fonte do projeto. O diretório `dist/` é apenas saída de build e não deve ser editado manualmente.
+
+Comando:
+
+```bash
+python setup.py build_exe
+```
+
+Fluxo recomendado:
+
+1. altere apenas os arquivos originais em `codigo/`, `setup.py`, `assets/` e templates;
+2. execute `python setup.py build_exe`;
+3. envie ao cliente a pasta gerada em `dist/ESI-Energia`.
+
+Regras importantes:
+
+- não edite arquivos dentro de `dist/`;
+- sempre gere novamente o build depois de mudar o código-fonte;
+- para distribuição, envie a pasta `dist/ESI-Energia` completa ou um `.zip` dessa pasta, não apenas o `.exe` isolado.
+
 ## Operação diária recomendada
 
 ### Para criar obras internas

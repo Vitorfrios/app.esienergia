@@ -1,4 +1,5 @@
 // scripts/03_Edit_data/main.js
+import "./config/request-bridge.js";
 import { createSmartLogger } from "../01_Create_Obra/core/logger.js";
 import "../01_Create_Obra/core/system-bootstrap.js";
 import { pendingChanges, hasRealChanges } from "./config/state.js";
@@ -165,7 +166,6 @@ function safeInvokeLoader(loaderName, loaderFn) {
 
 function refreshChangedSections(changes = [], options = {}) {
   const normalizedChanges = Array.isArray(changes) ? changes : [];
-  const refreshJsonEditor = options.refreshJsonEditor !== false;
   const refreshDashboard = options.refreshDashboard !== false;
 
   const loadersBySection = {
@@ -194,9 +194,6 @@ function refreshChangedSections(changes = [], options = {}) {
     safeInvokeLoader("dashboard", initializeDashboard);
   }
 
-  if (refreshJsonEditor && window.loadJSONEditor) {
-    safeInvokeLoader("json-editor", window.loadJSONEditor);
-  }
 }
 
 function refreshAllAdminViews() {
@@ -212,7 +209,6 @@ function refreshAllAdminViews() {
       "ADM",
     ],
     {
-      refreshJsonEditor: true,
       refreshDashboard: true,
     },
   );
@@ -361,16 +357,6 @@ document.addEventListener("DOMContentLoaded", async function () {
   initializeAdminCredentials();
 
   // Função para forçar atualização do editor quando a tab é aberta
-  window.activateJSONTab = function () {
-    console.log(" Ativando visualizador JSON...");
-
-    if (typeof window.loadJSONEditor === "function") {
-      setTimeout(() => {
-        window.loadJSONEditor();
-      }, 100);
-    }
-  };
-
   // Carregar dados iniciais
   setTimeout(async () => {
     console.log(" Iniciando carregamento de dados...");
@@ -396,23 +382,14 @@ document.addEventListener("DOMContentLoaded", async function () {
         initializeAdminCredentials();
 
         // Atualiza o visualizador com os dados carregados
-        if (typeof window.loadJSONEditor === "function") {
-          setTimeout(window.loadJSONEditor, 200);
-        }
       } catch (error) {
         console.error(" Erro ao carregar dados:", error);
 
         // Mesmo com erro, atualiza o visualizador com estrutura vazia
-        if (typeof window.loadJSONEditor === "function") {
-          setTimeout(window.loadJSONEditor, 200);
-        }
       }
     } else {
       console.warn(" Função loadData não encontrada");
       // Atualiza visualizador com estrutura vazia
-      if (typeof window.loadJSONEditor === "function") {
-        setTimeout(window.loadJSONEditor, 200);
-      }
     }
   }, 500);
 });
@@ -547,12 +524,6 @@ window.switchTab = function (tabName) {
           }
           break;
 
-        case "raw":
-          console.log(" Tab JSON ativada");
-          if (typeof window.loadJSONEditor === "function") {
-            window.loadJSONEditor();
-          }
-          break;
       }
     }, 100);
   }
@@ -572,18 +543,6 @@ document.addEventListener("DOMContentLoaded", function () {
         // Já tratado pelo onclick
       } else if (tabText.includes("credenciais") || tabText.includes("adm")) {
         // Já tratado pelo onclick
-      } else if (
-        tabText.includes("json") ||
-        tabText.includes("raw") ||
-        tabText.includes("bruto")
-      ) {
-        console.log(" Tab JSON clicada, atualizando visualizador...");
-
-        setTimeout(() => {
-          if (typeof window.loadJSONEditor === "function") {
-            window.loadJSONEditor();
-          }
-        }, 150);
       } else if (tabText.includes("dutos") || tabText.includes("duto")) {
         console.log(" Tab de dutos clicada");
 
@@ -637,74 +596,6 @@ document.addEventListener("DOMContentLoaded", function () {
 });
 
 // ==================== MÓDULO JSON VIEWER ====================
-
-const jsonViewerModule = {
-  loadJSONEditor: function () {
-    console.log(" Carregando visualizador JSON...");
-    const editor = document.getElementById("jsonEditor");
-    if (!editor) {
-      console.warn(" Visualizador JSON não encontrado");
-      return;
-    }
-
-    const systemData = window.systemData || {};
-    console.log(" Dados para o visualizador:", {
-      banco_acessorios: Object.keys(systemData.banco_acessorios || {}).length,
-      dutos: {
-        tipos: systemData.dutos?.tipos?.length || 0,
-        opcionais: systemData.dutos?.opcionais?.length || 0,
-      },
-      tubos: systemData.tubos?.length || 0,
-      ADM: systemData.ADM?.length || 0,
-    });
-
-    editor.readOnly = true;
-    editor.value = JSON.stringify(systemData, null, 2);
-  },
-
-  copyJSONToClipboard: async function (button) {
-    const editor = document.getElementById("jsonEditor");
-    if (!editor || !editor.value) {
-      console.warn(" Nenhum JSON disponível para copiar");
-      return;
-    }
-
-    const originalLabel = button?.textContent?.trim() || "Copiar JSON";
-
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(editor.value);
-      } else {
-        editor.focus();
-        editor.select();
-        document.execCommand("copy");
-        editor.setSelectionRange(0, 0);
-        editor.blur();
-      }
-
-      if (button) {
-        button.textContent = "Copiado";
-        setTimeout(() => {
-          button.textContent = originalLabel;
-        }, 1500);
-      }
-    } catch (error) {
-      console.error(" Erro ao copiar JSON:", error);
-
-      if (button) {
-        button.textContent = "Erro ao copiar";
-        setTimeout(() => {
-          button.textContent = originalLabel;
-        }, 1500);
-      }
-    }
-  },
-};
-
-// Atribuir função global do visualizador JSON
-window.loadJSONEditor = jsonViewerModule.loadJSONEditor.bind(jsonViewerModule);
-window.copyJSONToClipboard =
-  jsonViewerModule.copyJSONToClipboard.bind(jsonViewerModule);
 
 // ==================== EVENT LISTENERS ====================
 
@@ -760,8 +651,6 @@ window.addEventListener("dataImported", function (event) {
   if (window.loadDutos) window.loadDutos();
   if (window.loadTubos) window.loadTubos();
   if (window.filterMachines) window.filterMachines();
-  if (window.loadJSONEditor) window.loadJSONEditor();
-
   // Atualiza as novas abas
   refreshAdminArea();
 
@@ -825,28 +714,6 @@ window.debugSystemData = function () {
     Object.keys(window.systemData?.banco_acessorios || {}),
   );
 
-  // Verifica o editor
-  const editor = document.getElementById("jsonEditor");
-  if (editor && editor.value) {
-    try {
-      const parsed = JSON.parse(editor.value);
-      console.log("Editor tem banco_acessorios?", "banco_acessorios" in parsed);
-      console.log("Editor tem dutos?", "dutos" in parsed);
-      console.log("Editor tem tubos?", "tubos" in parsed);
-      console.log("Editor tem ADM?", "ADM" in parsed);
-      console.log(
-        "Acessórios no editor:",
-        Object.keys(parsed?.banco_acessorios || {}).length,
-      );
-      console.log(
-        "Tipos de dutos no editor:",
-        parsed?.dutos?.tipos?.length || 0,
-      );
-      console.log("Tubos no editor:", parsed?.tubos?.length || 0);
-    } catch (e) {
-      console.error("Erro ao parsear editor:", e);
-    }
-  }
 };
 
 // Função para forçar recarregamento completo

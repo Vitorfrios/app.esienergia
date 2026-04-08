@@ -944,6 +944,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self, include_admin_sections=False, sanitize_for_client=False
     ):
         dados_payload = self.routes_core.system_repository.get_dados_payload()
+        storage_status = self.routes_core.handle_get_storage_status()
         base_payload = {
             "constants": dados_payload.get("constants", {}),
             "machines": self.routes_core.machine_repository.get_all(),
@@ -951,6 +952,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             "banco_acessorios": dados_payload.get("banco_acessorios", {}),
             "dutos": dados_payload.get("dutos", []),
             "tubos": dados_payload.get("tubos", []),
+            "storage_status": storage_status,
         }
 
         if include_admin_sections:

@@ -4,24 +4,31 @@ from __future__ import annotations
 
 import json
 
-from servidor_modules.database.connection import execute_maintenance_statements
+from servidor_modules.database.connection import (
+    evaluate_storage_guard,
+    execute_maintenance_statements,
+    get_database_path,
+    get_storage_guard_snapshot,
+    has_pending_local_offline_changes,
+    mark_local_offline_change,
+    refresh_local_sql_dump,
+)
 from servidor_modules.database.storage import get_storage
 
 
 class SystemRepository:
-    DATABASE_LIMIT_CONSTANT_KEY = "SUPABASE_DB_LIMIT_MB"
     DEFAULT_DATABASE_LIMIT_MB = 500
-    SYSTEM_CONSTANT_DEFAULTS = {
-        DATABASE_LIMIT_CONSTANT_KEY: {
-            "value": DEFAULT_DATABASE_LIMIT_MB,
-            "description": "Limite total do banco Supabase em MB para monitoramento do dashboard.",
-        }
-    }
+    EXCLUDED_CONSTANT_KEYS = {"SUPABASE_DB_LIMIT_MB"}
     STORAGE_STATUS_MESSAGES = {
         "normal": "Armazenamento funcionando normalmente.",
         "warning": "O sistema ainda esta funcionando normalmente. O banco de dados reutiliza espaco automaticamente apos exclusoes.",
         "high": "O armazenamento esta proximo do limite, mas isso nao significa erro imediato. O Supabase pode demorar um pouco para liberar espaco apos exclusoes.",
     }
+
+    def _sync_local_offline_sidecars(self, source):
+        if getattr(self.conn, "is_sqlite", False):
+            refresh_local_sql_dump(self.storage.project_root)
+            mark_local_offline_change(self.storage.project_root, source=source)
     STORAGE_STATUS_LABELS = {
         "normal": "Normal",
         "warning": "Atencao",
@@ -59,7 +66,11 @@ class SystemRepository:
 
     def __init__(self, project_root):
         self.storage = get_storage(project_root)
-        self.conn = self.storage.conn
+
+    @property
+    def conn(self):
+        self.storage.refresh_connection_mode()
+        return self.storage.conn
 
     @staticmethod
     def _bytes_to_mb(size_bytes):
@@ -110,6 +121,8 @@ class SystemRepository:
             key_str = str(key or "").strip()
             if not key_str:
                 continue
+            if key_str in self.EXCLUDED_CONSTANT_KEYS:
+                continue
 
             if isinstance(constant_data, dict):
                 normalized[key_str] = dict(constant_data)
@@ -119,32 +132,7 @@ class SystemRepository:
                     "description": "",
                 }
 
-        for key, default_data in self.SYSTEM_CONSTANT_DEFAULTS.items():
-            current_data = normalized.get(key, {})
-            if not isinstance(current_data, dict):
-                current_data = {}
-
-            normalized[key] = {
-                **current_data,
-                "value": self._normalize_numeric_value(
-                    current_data.get("value"),
-                    default_data["value"],
-                ),
-                "description": str(
-                    current_data.get("description") or default_data["description"]
-                ).strip()
-                or default_data["description"],
-            }
-
         return normalized
-
-    def _resolve_database_limit_mb(self):
-        constants = self.get_constants()
-        constant_data = constants.get(self.DATABASE_LIMIT_CONSTANT_KEY, {})
-        return self._normalize_numeric_value(
-            constant_data.get("value"),
-            self.DEFAULT_DATABASE_LIMIT_MB,
-        )
 
     def _resolve_storage_status(self, percent_used):
         normalized_percent = float(percent_used or 0)
@@ -160,20 +148,68 @@ class SystemRepository:
     def _build_storage_status_payload(self, payload):
         usage_payload = dict(payload or {})
         status = self._resolve_storage_status(usage_payload.get("percent_used"))
+        usage_payload.update(self._build_data_source_status_payload())
 
         usage_payload.update(
             {
                 "status": status,
                 "status_label": self.STORAGE_STATUS_LABELS[status],
-                "message": self.STORAGE_STATUS_MESSAGES[status],
+                "message": usage_payload.get("message") or self.STORAGE_STATUS_MESSAGES[status],
                 "explanation": self.STORAGE_EXPLANATION,
                 "update_note": self.STORAGE_UPDATE_NOTE,
-                "maintenance_available": True,
-                "maintenance_action_label": self.STORAGE_REORGANIZE_LABEL,
-                "maintenance_message": self.STORAGE_REORGANIZE_MESSAGE,
+                "maintenance_available": usage_payload.get("maintenance_available", True),
+                "maintenance_action_label": usage_payload.get("maintenance_action_label") or self.STORAGE_REORGANIZE_LABEL,
+                "maintenance_message": usage_payload.get("maintenance_message") or self.STORAGE_REORGANIZE_MESSAGE,
             }
         )
         return usage_payload
+
+    def _build_data_source_status_payload(self):
+        using_local_database = bool(getattr(self.conn, "is_sqlite", False))
+        pending_offline_changes = has_pending_local_offline_changes(
+            self.storage.project_root
+        )
+        storage_guard = get_storage_guard_snapshot(self.storage.project_root)
+        if pending_offline_changes or not using_local_database:
+            try:
+                storage_guard = evaluate_storage_guard(
+                    self.storage.project_root,
+                    conn=None if using_local_database else self.conn,
+                )
+            except Exception:
+                storage_guard = {
+                    "forced_offline": False,
+                    "reason": "",
+                }
+
+        if using_local_database:
+            mode = "offline"
+            mode_label = "Offline"
+            database_label = "Base local (SQLite)"
+            summary = "Usando base local."
+        else:
+            mode = "online"
+            mode_label = "Online"
+            database_label = "Base online (PostgreSQL)"
+            summary = "Usando base online."
+
+        pending_sync_message = ""
+        if pending_offline_changes:
+            pending_sync_message = (
+                "Alteracoes offline pendentes. Recomendado exportar antes de continuar."
+            )
+        elif storage_guard.get("forced_offline"):
+            pending_sync_message = str(storage_guard.get("reason") or "").strip()
+
+        return {
+            "data_source_mode": mode,
+            "data_source_label": mode_label,
+            "database_label": database_label,
+            "data_source_summary": summary,
+            "pending_offline_changes": pending_offline_changes,
+            "storage_guard_active": bool(storage_guard.get("forced_offline")),
+            "pending_sync_message": pending_sync_message,
+        }
 
     def get_dados_payload(self):
         payload = self.storage.load_document(
@@ -221,6 +257,7 @@ class SystemRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("system:save-admins")
         return admins
 
     def get_constants(self):
@@ -250,6 +287,7 @@ class SystemRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("system:save-constants")
         return normalized_constants
 
     def get_materials(self):
@@ -282,6 +320,29 @@ class SystemRepository:
         return self.get_database_usage(limit_mb=limit_mb)
 
     def get_database_usage(self, limit_mb=None):
+        if getattr(self.conn, "is_sqlite", False):
+            sqlite_path = get_database_path(self.storage.project_root)
+            size_bytes = sqlite_path.stat().st_size if sqlite_path.exists() else 0
+            used_mb = self._bytes_to_mb(size_bytes)
+            limit_mb = self._normalize_numeric_value(
+                limit_mb,
+                self.DEFAULT_DATABASE_LIMIT_MB,
+            )
+            percent_used = round((used_mb / limit_mb) * 100, 2) if limit_mb else 0.0
+            return self._build_storage_status_payload(
+                {
+                    "used_mb": used_mb,
+                    "limit_mb": limit_mb,
+                    "percent_used": percent_used,
+                    "public_schema_mb": used_mb,
+                    "active_app_mb": used_mb,
+                    "active_app_percent_of_limit": percent_used,
+                    "other_schemas_mb": 0.0,
+                    "maintenance_available": False,
+                    "maintenance_message": "Rotinas de reorganizacao sao aplicaveis apenas ao banco online.",
+                }
+            )
+
         row = self.conn.execute(
             """
             SELECT pg_database_size(current_database()) AS size_bytes
@@ -301,7 +362,7 @@ class SystemRepository:
         other_schemas_mb = max(round(used_mb - public_schema_mb, 2), 0.0)
         limit_mb = self._normalize_numeric_value(
             limit_mb,
-            self._resolve_database_limit_mb(),
+            self.DEFAULT_DATABASE_LIMIT_MB,
         )
         percent_used = round((used_mb / limit_mb) * 100, 2) if limit_mb else 0.0
         active_app_percent_of_limit = (
@@ -325,7 +386,7 @@ class SystemRepository:
 
         safe_limit_mb = self._normalize_numeric_value(
             limit_mb,
-            self._resolve_database_limit_mb(),
+            self.DEFAULT_DATABASE_LIMIT_MB,
         )
         tables = []
 
@@ -367,6 +428,7 @@ class SystemRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("system:save-materials")
         return materials
 
     def save_acessorios(self, acessorios):

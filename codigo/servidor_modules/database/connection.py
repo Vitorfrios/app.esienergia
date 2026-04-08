@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
+import shutil
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -168,8 +170,11 @@ _WARMUP_STARTED_ROOTS = set()
 _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE = {}
 _DOTENV_LOCK = threading.Lock()
 _DOTENV_LOADED_PATHS = set()
+_RECENT_ONLINE_FAILURES = {}
 SYNC_METADATA_FILENAME = "sync-metadata.json"
 SYNC_BASELINE_FILENAME = "sync-base.json"
+_STORAGE_GUARD_FORCE_OFFLINE_PERCENT = 90.0
+_STORAGE_GUARD_RESUME_PERCENT = 80.0
 _SQLITE_SYNC_TABLES = (
     "admins",
     "empresas",
@@ -206,6 +211,17 @@ _SYNC_PRIMARY_KEYS = {
     "obra_notifications": ("obra_id",),
 }
 _SYNC_CONFLICT_METADATA_LIMIT = 50
+_SYNC_VALUE_MISSING = object()
+_POOL_TIMEOUT_SECONDS = float(os.environ.get("DATABASE_POOL_TIMEOUT_SECONDS", "15"))
+_POOL_RECONNECT_TIMEOUT_SECONDS = float(
+    os.environ.get("DATABASE_POOL_RECONNECT_TIMEOUT_SECONDS", "15")
+)
+_POOL_CONNECT_TIMEOUT_SECONDS = int(
+    max(1, round(float(os.environ.get("DATABASE_CONNECT_TIMEOUT_SECONDS", "15"))))
+)
+
+logging.getLogger("psycopg.pool").setLevel(logging.CRITICAL)
+logging.getLogger("psycopg").setLevel(logging.CRITICAL)
 
 
 class SyncConflictError(RuntimeError):
@@ -262,6 +278,51 @@ def get_sync_baseline_path(project_root) -> Path:
     return Path(project_root) / "database" / SYNC_BASELINE_FILENAME
 
 
+def _record_recent_online_failure(root_key: str, error=None) -> None:
+    _RECENT_ONLINE_FAILURES[root_key] = {
+        "time": datetime.now(timezone.utc).timestamp(),
+        "error": str(error or "").strip(),
+    }
+
+
+def _clear_recent_online_failure(root_key: str) -> None:
+    _RECENT_ONLINE_FAILURES.pop(root_key, None)
+
+
+def clear_recent_online_failure(project_root) -> None:
+    root_key = str(Path(project_root).resolve())
+    _clear_recent_online_failure(root_key)
+
+
+def has_recent_online_failure(project_root, *, max_age_seconds=120) -> bool:
+    root_key = str(Path(project_root).resolve())
+    failure_info = _RECENT_ONLINE_FAILURES.get(root_key)
+    if not failure_info:
+        return False
+
+    failure_time = float(failure_info.get("time") or 0)
+    now = datetime.now(timezone.utc).timestamp()
+    if now - failure_time > float(max_age_seconds):
+        _RECENT_ONLINE_FAILURES.pop(root_key, None)
+        return False
+    return True
+
+
+def ensure_local_sqlite_database(project_root) -> Path:
+    sqlite_path = get_database_path(project_root).resolve()
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+
+    sqlite_conn = sqlite3.connect(str(sqlite_path))
+    try:
+        sqlite_conn.execute("PRAGMA foreign_keys = OFF")
+        sqlite_conn.executescript(SCHEMA_SQL)
+        sqlite_conn.commit()
+    finally:
+        sqlite_conn.close()
+
+    return sqlite_path
+
+
 def get_database_url(project_root=None) -> str:
     _load_environment_file(project_root)
     raw_url = str(os.environ.get("DATABASE_URL") or "").strip()
@@ -272,26 +333,51 @@ def get_database_url(project_root=None) -> str:
     return _enforce_ssl_mode(raw_url)
 
 
-def get_connection(project_root):
+def get_connection(project_root, *, wait_timeout_seconds=None):
     root_key = str(Path(project_root).resolve())
+    effective_wait_timeout = float(
+        _POOL_TIMEOUT_SECONDS if wait_timeout_seconds is None else wait_timeout_seconds
+    )
+    effective_connect_timeout = int(
+        max(1, round(min(_POOL_CONNECT_TIMEOUT_SECONDS, effective_wait_timeout)))
+    )
+    effective_reconnect_timeout = min(
+        _POOL_RECONNECT_TIMEOUT_SECONDS,
+        effective_wait_timeout,
+    )
     with _POOL_LOCK:
         proxy = _PROXIES.get(root_key)
         if proxy is None:
-            pool = ConnectionPool(
-                conninfo=get_database_url(project_root),
-                min_size=1,
-                max_size=int(os.environ.get("DATABASE_POOL_MAX_SIZE", "10")),
-                timeout=30,
-                kwargs={
-                    "autocommit": False,
-                    "row_factory": dict_row,
-                },
-                open=True,
-            )
-            pool.wait()
-            proxy = DatabaseConnectionProxy(pool)
-            _POOLS[root_key] = pool
-            _PROXIES[root_key] = proxy
+            pool = None
+            try:
+                pool = ConnectionPool(
+                    conninfo=get_database_url(project_root),
+                    min_size=1,
+                    max_size=int(os.environ.get("DATABASE_POOL_MAX_SIZE", "10")),
+                    timeout=effective_wait_timeout,
+                    reconnect_timeout=effective_reconnect_timeout,
+                    kwargs={
+                        "autocommit": False,
+                        "row_factory": dict_row,
+                        "connect_timeout": effective_connect_timeout,
+                    },
+                    open=True,
+                )
+                pool.wait(timeout=effective_wait_timeout)
+                proxy = DatabaseConnectionProxy(pool)
+                _POOLS[root_key] = pool
+                _PROXIES[root_key] = proxy
+                _clear_recent_online_failure(root_key)
+            except Exception as exc:
+                if pool is not None:
+                    try:
+                        pool.close()
+                    except Exception:
+                        pass
+                _record_recent_online_failure(root_key, exc)
+                raise
+        else:
+            _clear_recent_online_failure(root_key)
 
     _initialize_database(project_root, root_key)
     return proxy
@@ -362,22 +448,59 @@ def _run_connection_warmup(project_root) -> None:
     try:
         get_connection(project_root)
         release_thread_connection(project_root)
-        print(" PostgreSQL pronto para uso.")
+        print(" Banco online conectado com sucesso.")
         startup_sync_result = refresh_offline_snapshot_on_startup(project_root)
         if startup_sync_result.get("success"):
-            print(" Snapshot offline local atualizado na inicializacao.")
-        elif startup_sync_result.get("skipped"):
+            storage_status = startup_sync_result.get("storage_status") or {}
+            storage_suffix = ""
+            if storage_status.get("online_available"):
+                storage_suffix = (
+                    f" Online: {storage_status.get('used_mb', 0)} MB de "
+                    f"{storage_status.get('limit_mb', 0)} MB "
+                    f"({storage_status.get('percent_used', 0)}%)."
+                )
             print(
-                " Snapshot offline local preservado na inicializacao:",
-                startup_sync_result.get("message") or startup_sync_result.get("error"),
+                " Sincronizacao inicial concluida:",
+                startup_sync_result.get("message") or "Estado alinhado.",
+                storage_suffix,
             )
+        elif startup_sync_result.get("skipped"):
+            if startup_sync_result.get("storage_guard_active"):
+                print(
+                    " Banco online com pouco espaco. Sistema iniciado com a base local ate o uso cair para 80%."
+                )
+                startup_detail = startup_sync_result.get("message") or startup_sync_result.get("error")
+                if os.environ.get("ESI_DEBUG_STARTUP") == "1" and str(startup_detail or "").strip():
+                    print(f" Detalhe tecnico: {startup_detail}")
+            elif startup_sync_result.get("manual_sync_required"):
+                print(
+                    " Historico local restaurado. Sistema iniciado com os dados offline."
+                )
+                startup_detail = startup_sync_result.get("message") or startup_sync_result.get("error")
+                if os.environ.get("ESI_DEBUG_STARTUP") == "1" and str(startup_detail or "").strip():
+                    print(f" Detalhe tecnico: {startup_detail}")
+            elif startup_sync_result.get("online_available"):
+                print(" Banco online disponivel. Sistema iniciado com o banco local.")
+                startup_detail = startup_sync_result.get("message") or startup_sync_result.get("error")
+                if os.environ.get("ESI_DEBUG_STARTUP") == "1" and str(startup_detail or "").strip():
+                    print(f" Detalhe tecnico: {startup_detail}")
+            else:
+                print(" Banco online indisponivel. Sistema iniciado com o banco local.")
+                startup_detail = startup_sync_result.get("message") or startup_sync_result.get("error")
+                if os.environ.get("ESI_DEBUG_STARTUP") == "1" and str(startup_detail or "").strip():
+                    print(f" Detalhe tecnico: {startup_detail}")
         elif startup_sync_result.get("error"):
             print(
-                " Aviso na atualizacao do snapshot offline na inicializacao:",
+                " Aviso na inicializacao do banco offline:",
                 startup_sync_result["error"],
             )
     except Exception as exc:
-        print(f" Aviso no warmup do PostgreSQL: {exc}")
+        print(
+            " Nao foi possivel conectar ao banco online em ate "
+            f"{_POOL_TIMEOUT_SECONDS:.0f} segundos. Inicializando o sistema offline."
+        )
+        if os.environ.get("ESI_DEBUG_STARTUP") == "1" and str(exc).strip():
+            print(f" Detalhe tecnico: {exc}")
 
 
 def migrate_sqlite_to_postgres(project_root):
@@ -425,6 +548,7 @@ def sync_postgres_to_sqlite(project_root, *, mode="manual-import", allow_unmanag
             current_state["sqlite_exists"]
             and baseline_available
             and local_payload != baseline_payload
+            and not allow_unmanaged_local
         ):
             raise SyncConflictError(
                 "O banco offline local possui alteracoes fora da ultima sincronizacao gerenciada. "
@@ -482,6 +606,19 @@ def sync_sqlite_to_postgres(project_root, *, mode="manual-export"):
     conn = get_connection(project_root)
 
     try:
+        storage_guard = evaluate_storage_guard(project_root, conn=conn)
+        if storage_guard.get("forced_offline"):
+            return {
+                "success": False,
+                "skipped": True,
+                "online_available": True,
+                "storage_guard_active": True,
+                "message": storage_guard.get("reason")
+                or "Banco online com pouco espaco. Sistema mantendo a base local por seguranca.",
+                "mode": mode,
+                "storage_status": storage_guard.get("storage_status") or {},
+            }
+
         current_state = _get_current_sync_state(project_root, conn)
         local_payload = current_state["local_payload"]
         online_payload = current_state["online_payload"]
@@ -518,12 +655,6 @@ def sync_sqlite_to_postgres(project_root, *, mode="manual-export"):
             raise SyncConflictError(
                 "Nao existe base de sincronizacao confiavel entre offline e online. "
                 "Use Importar primeiro para criar a base antes de Exportar."
-            )
-
-        if online_payload != baseline_payload:
-            raise SyncConflictError(
-                "O banco online mudou depois da ultima base sincronizada com o offline. "
-                "Importe novamente antes de exportar para evitar sobrescrever dados online."
             )
 
         if local_payload == baseline_payload and online_payload == baseline_payload:
@@ -586,7 +717,50 @@ def reconcile_offline_and_online(project_root, *, mode="auto-reconcile"):
 
     try:
         conn = get_connection(project_root)
+    except Exception as exc:
+        return {
+            "success": False,
+            "skipped": True,
+            "online_available": False,
+            "message": "Banco online indisponivel. Sistema iniciado com o banco local.",
+            "error": str(exc),
+            "mode": mode,
+            "failure_stage": "connect-online",
+        }
+
+    try:
         current_state = _get_current_sync_state(project_root, conn)
+        metadata = _load_sync_metadata(project_root)
+        offline_state = dict(metadata.get("offline") or {})
+        if offline_state.get("manual_sync_required") or offline_state.get("local_changes_pending"):
+            return {
+                "success": False,
+                "skipped": True,
+                "online_available": True,
+                "manual_sync_required": True,
+                "notice_pending": bool(offline_state.get("restored_notice_pending")),
+                "message": (
+                    "Historico restaurado. Sistema usando os dados offline no momento. "
+                    "Recomendado exportar para sincronizar."
+                ),
+                "mode": mode,
+                "failure_stage": "manual-sync-required",
+            }
+
+        storage_guard = evaluate_storage_guard(project_root, conn=conn)
+        if storage_guard.get("forced_offline"):
+            return {
+                "success": False,
+                "skipped": True,
+                "online_available": True,
+                "storage_guard_active": True,
+                "message": storage_guard.get("reason")
+                or "Banco online com pouco espaco. Sistema mantendo a base local por seguranca.",
+                "mode": mode,
+                "failure_stage": "storage-guard",
+                "storage_status": storage_guard.get("storage_status") or {},
+            }
+
         online_payload = current_state["online_payload"]
         local_payload = current_state["local_payload"]
         sqlite_path = current_state["sqlite_path"]
@@ -749,19 +923,19 @@ def reconcile_offline_and_online(project_root, *, mode="auto-reconcile"):
             "online_to_offline_count": merge_result["online_to_offline_count"],
             "blocked_offline_to_online_count": len(merge_result["blocked_offline_changes"]),
             "conflict_count": len(merge_result["conflicts"]),
+            "conflicted_field_count": merge_result["conflicted_field_count"],
             "conflicts": merge_result["conflicts"],
         }
     except Exception as exc:
+        error_text = str(exc).strip()
         return {
             "success": False,
             "skipped": True,
-            "online_available": False,
-            "message": (
-                "Sem conexao valida com o Supabase. O banco offline local foi preservado "
-                "e sera reconciliado quando a conexao voltar."
-            ),
-            "error": str(exc),
+            "online_available": True,
+            "message": "Banco online disponivel. Sistema usando o banco online no momento.",
+            "error": error_text,
             "mode": mode,
+            "failure_stage": "reconcile-runtime",
         }
     finally:
         if conn is not None:
@@ -774,7 +948,7 @@ def _empty_sync_payload():
 
 def _default_sync_metadata():
     return {
-        "version": 2,
+        "version": 4,
         "baseline": {
             "digest": "",
             "snapshot_path": "",
@@ -788,6 +962,11 @@ def _default_sync_metadata():
             "last_synced_at": "",
             "sqlite_path": "",
             "sql_dump_path": "",
+            "local_changes_pending": False,
+            "manual_sync_required": False,
+            "restored_notice_pending": False,
+            "last_local_change_at": "",
+            "last_local_change_source": "",
         },
         "online": {
             "last_seen_digest": "",
@@ -804,6 +983,12 @@ def _default_sync_metadata():
             "last_conflicts": [],
             "last_blocked_offline_changes_count": 0,
             "last_blocked_offline_changes": [],
+        },
+        "storage_guard": {
+            "forced_offline": False,
+            "last_percent_used": 0.0,
+            "last_checked_at": "",
+            "reason": "",
         },
     }
 
@@ -830,6 +1015,8 @@ def _load_sync_metadata(project_root) -> dict:
             metadata["online"].update(raw_metadata["online"])
         if isinstance(raw_metadata.get("reconcile"), dict):
             metadata["reconcile"].update(raw_metadata["reconcile"])
+        if isinstance(raw_metadata.get("storage_guard"), dict):
+            metadata["storage_guard"].update(raw_metadata["storage_guard"])
     return metadata
 
 
@@ -840,6 +1027,113 @@ def _save_sync_metadata(project_root, metadata: dict) -> None:
     with temp_path.open("w", encoding="utf-8", newline="\n") as metadata_file:
         json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
     temp_path.replace(metadata_path)
+
+
+def mark_local_offline_change(project_root, *, source="local-edit") -> dict:
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    offline_metadata = dict(metadata.get("offline") or {})
+    offline_metadata.update(
+        {
+            "local_changes_pending": True,
+            "manual_sync_required": True,
+            "restored_notice_pending": True,
+            "last_local_change_at": now_iso,
+            "last_local_change_source": str(source or "local-edit"),
+        }
+    )
+    metadata["offline"] = offline_metadata
+    _save_sync_metadata(project_root, metadata)
+    return metadata
+
+
+def has_pending_local_offline_changes(project_root) -> bool:
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    offline_metadata = dict(metadata.get("offline") or {})
+    return bool(
+        offline_metadata.get("local_changes_pending")
+        or offline_metadata.get("manual_sync_required")
+    )
+
+
+def evaluate_storage_guard(project_root, *, conn=None) -> dict:
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    storage_guard = dict(metadata.get("storage_guard") or {})
+
+    own_connection = False
+    if conn is None:
+        conn = get_connection(project_root, wait_timeout_seconds=2)
+        own_connection = True
+
+    try:
+        storage_status = _get_online_storage_status(conn)
+        percent_used = float(storage_status.get("percent_used") or 0.0)
+        forced_before = bool(storage_guard.get("forced_offline"))
+        if forced_before:
+            forced_offline = percent_used > _STORAGE_GUARD_RESUME_PERCENT
+        else:
+            forced_offline = percent_used >= _STORAGE_GUARD_FORCE_OFFLINE_PERCENT
+
+        reason = ""
+        if forced_offline:
+            reason = (
+                "Banco online com pouco espaco. Sistema usando base local "
+                f"ate o uso cair para {_STORAGE_GUARD_RESUME_PERCENT:.0f}%."
+            )
+
+        metadata["storage_guard"] = {
+            "forced_offline": forced_offline,
+            "last_percent_used": round(percent_used, 2),
+            "last_checked_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+        }
+        _save_sync_metadata(project_root, metadata)
+
+        return {
+            "online_available": True,
+            "forced_offline": forced_offline,
+            "reason": reason,
+            "storage_status": storage_status,
+        }
+    finally:
+        if own_connection:
+            release_thread_connection(project_root)
+
+
+def get_storage_guard_snapshot(project_root) -> dict:
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    storage_guard = dict(metadata.get("storage_guard") or {})
+    return {
+        "forced_offline": bool(storage_guard.get("forced_offline")),
+        "last_percent_used": float(storage_guard.get("last_percent_used") or 0.0),
+        "last_checked_at": str(storage_guard.get("last_checked_at") or ""),
+        "reason": str(storage_guard.get("reason") or ""),
+    }
+
+
+def clear_local_offline_change_flag(project_root) -> dict:
+    project_root = Path(project_root).resolve()
+    metadata = _load_sync_metadata(project_root)
+    offline_metadata = dict(metadata.get("offline") or {})
+    offline_metadata.update(
+        {
+            "local_changes_pending": False,
+            "manual_sync_required": False,
+            "restored_notice_pending": False,
+        }
+    )
+    metadata["offline"] = offline_metadata
+    _save_sync_metadata(project_root, metadata)
+    return metadata
+
+
+def refresh_local_sql_dump(project_root) -> str:
+    sql_dump_path = _refresh_sql_dump_from_existing_sqlite(project_root)
+    return str(sql_dump_path)
 
 
 def _load_sync_baseline_payload(project_root):
@@ -939,6 +1233,15 @@ def _persist_sync_state(
         "last_synced_at": now_iso,
         "sqlite_path": str(sqlite_path or ""),
         "sql_dump_path": str(sql_dump_path or ""),
+        "local_changes_pending": False,
+        "manual_sync_required": False,
+        "restored_notice_pending": False,
+        "last_local_change_at": str(
+            (metadata.get("offline") or {}).get("last_local_change_at") or ""
+        ),
+        "last_local_change_source": str(
+            (metadata.get("offline") or {}).get("last_local_change_source") or ""
+        ),
     }
     metadata["online"] = {
         **metadata.get("online", {}),
@@ -984,6 +1287,8 @@ def _trim_sync_items_for_metadata(items):
                 "item": str(item.get("item") or ""),
                 "identity": dict(item.get("identity") or {}),
                 "changed_columns": list(item.get("changed_columns") or []),
+                "field_conflicts": list(item.get("field_conflicts") or []),
+                "auto_merged_columns": list(item.get("auto_merged_columns") or []),
                 "reason": str(item.get("reason") or ""),
             }
         )
@@ -996,25 +1301,6 @@ def _get_online_storage_status(conn):
         size_row = cursor.fetchone() or {}
 
     limit_mb = 500.0
-    if _postgres_table_exists(conn, "constants"):
-        with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                "SELECT value_json FROM constants WHERE key = %s",
-                ("SUPABASE_DB_LIMIT_MB",),
-            )
-            constant_row = cursor.fetchone() or {}
-        raw_value_json = constant_row.get("value_json")
-        if raw_value_json:
-            try:
-                if isinstance(raw_value_json, (dict, list, int, float)):
-                    parsed_value = raw_value_json
-                else:
-                    parsed_value = json.loads(str(raw_value_json))
-                if isinstance(parsed_value, dict):
-                    parsed_value = parsed_value.get("value")
-                limit_mb = _normalize_sync_limit_mb(parsed_value, 500.0)
-            except Exception:
-                pass
 
     used_mb = round(float(size_row.get("size_bytes") or 0) / (1024 * 1024), 2)
     percent_used = round((used_mb / limit_mb) * 100, 2) if limit_mb else 0.0
@@ -1057,8 +1343,9 @@ def _merge_sync_payloads(
     next_baseline_payload = _empty_sync_payload()
     conflicts = []
     blocked_offline_changes = []
-    offline_to_online_count = 0
-    online_to_offline_count = 0
+    offline_to_online_keys = set()
+    online_to_offline_keys = set()
+    conflicted_field_count = 0
 
     for table_name in _SQLITE_SYNC_TABLES:
         baseline_rows = _index_rows_by_identity(table_name, baseline_payload.get(table_name) or [])
@@ -1093,7 +1380,7 @@ def _merge_sync_payloads(
                 if allow_online_writes:
                     _set_indexed_row(resolved_online_rows, identity, offline_row)
                     _set_indexed_row(resolved_baseline_rows, identity, offline_row)
-                    offline_to_online_count += 1
+                    offline_to_online_keys.add((table_name, identity))
                 else:
                     _set_indexed_row(resolved_online_rows, identity, online_row)
                     _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
@@ -1113,26 +1400,97 @@ def _merge_sync_payloads(
                 _set_indexed_row(resolved_online_rows, identity, online_row)
                 _set_indexed_row(resolved_offline_rows, identity, online_row)
                 _set_indexed_row(resolved_baseline_rows, identity, online_row)
-                online_to_offline_count += 1
+                online_to_offline_keys.add((table_name, identity))
                 continue
 
             if offline_changed and online_changed:
-                _set_indexed_row(resolved_online_rows, identity, online_row)
-                _set_indexed_row(resolved_offline_rows, identity, offline_row)
-                _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
-                conflicts.append(
-                    _build_sync_item_entry(
-                        table_name,
-                        identity,
-                        baseline_row,
-                        offline_row,
-                        online_row,
-                        reason=(
-                            "Mesmo item alterado online e offline desde a ultima base comum. "
-                            "Sugestao: verificar manualmente antes de forcar uma sincronizacao."
-                        ),
-                    )
+                merged_row_result = _merge_sync_row_fields(
+                    table_name,
+                    identity,
+                    baseline_row,
+                    offline_row,
+                    online_row,
+                    allow_online_writes=allow_online_writes,
                 )
+                if merged_row_result is None:
+                    _set_indexed_row(resolved_online_rows, identity, online_row)
+                    _set_indexed_row(resolved_offline_rows, identity, offline_row)
+                    _set_indexed_row(resolved_baseline_rows, identity, baseline_row)
+                    conflicts.append(
+                        _build_sync_item_entry(
+                            table_name,
+                            identity,
+                            baseline_row,
+                            offline_row,
+                            online_row,
+                            reason=(
+                                "O mesmo registro foi alterado de formas incompatíveis no online e no offline. "
+                                "Revise manualmente antes de escolher Importar ou Exportar."
+                            ),
+                        )
+                    )
+                    conflicted_field_count += 1
+                    continue
+
+                _set_indexed_row(
+                    resolved_online_rows,
+                    identity,
+                    merged_row_result["resolved_online_row"],
+                )
+                _set_indexed_row(
+                    resolved_offline_rows,
+                    identity,
+                    merged_row_result["resolved_offline_row"],
+                )
+                _set_indexed_row(
+                    resolved_baseline_rows,
+                    identity,
+                    merged_row_result["resolved_baseline_row"],
+                )
+
+                if merged_row_result["export_applied"]:
+                    offline_to_online_keys.add((table_name, identity))
+                if merged_row_result["import_applied"]:
+                    online_to_offline_keys.add((table_name, identity))
+
+                if merged_row_result["blocked_columns"]:
+                    blocked_offline_changes.append(
+                        _build_sync_item_entry(
+                            table_name,
+                            identity,
+                            baseline_row,
+                            merged_row_result["resolved_offline_row"],
+                            merged_row_result["resolved_online_row"],
+                            changed_columns=merged_row_result["blocked_columns"],
+                            auto_merged_columns=merged_row_result["auto_merged_columns"],
+                            reason=(
+                                "Alguns campos offline continuam apenas no computador porque o banco online "
+                                "esta sem espaco suficiente para receber novas escritas agora."
+                            ),
+                        )
+                    )
+
+                if merged_row_result["field_conflicts"]:
+                    conflicts.append(
+                        _build_sync_item_entry(
+                            table_name,
+                            identity,
+                            baseline_row,
+                            merged_row_result["resolved_offline_row"],
+                            merged_row_result["resolved_online_row"],
+                            changed_columns=[
+                                item["field"] for item in merged_row_result["field_conflicts"]
+                            ],
+                            field_conflicts=merged_row_result["field_conflicts"],
+                            auto_merged_columns=merged_row_result["auto_merged_columns"],
+                            reason=(
+                                "Os campos abaixo foram alterados ao mesmo tempo no online e no offline. "
+                                "O sistema manteve o valor offline no computador e o valor online no banco "
+                                "para evitar perda de dados."
+                            ),
+                        )
+                    )
+                    conflicted_field_count += len(merged_row_result["field_conflicts"])
                 continue
 
             _set_indexed_row(resolved_online_rows, identity, online_row)
@@ -1147,9 +1505,10 @@ def _merge_sync_payloads(
         "final_online_payload": final_online_payload,
         "final_offline_payload": final_offline_payload,
         "baseline_payload": next_baseline_payload,
-        "offline_to_online_count": offline_to_online_count,
-        "online_to_offline_count": online_to_offline_count,
+        "offline_to_online_count": len(offline_to_online_keys),
+        "online_to_offline_count": len(online_to_offline_keys),
         "conflicts": conflicts,
+        "conflicted_field_count": conflicted_field_count,
         "blocked_offline_changes": blocked_offline_changes,
     }
 
@@ -1187,7 +1546,158 @@ def _format_sync_item_label(table_name, identity):
     return f"{table_name}[{', '.join(parts)}]"
 
 
-def _build_sync_item_entry(table_name, identity, baseline_row, offline_row, online_row, *, reason):
+def _merge_sync_row_fields(
+    table_name,
+    identity,
+    baseline_row,
+    offline_row,
+    online_row,
+    *,
+    allow_online_writes,
+):
+    if not isinstance(offline_row, dict) or not isinstance(online_row, dict):
+        return None
+
+    primary_keys = set(_SYNC_PRIMARY_KEYS[table_name])
+    resolved_offline_row = _normalize_row_for_sync(offline_row)
+    resolved_online_row = _normalize_row_for_sync(online_row)
+    resolved_baseline_row = (
+        _normalize_row_for_sync(baseline_row)
+        if isinstance(baseline_row, dict)
+        else {}
+    )
+
+    all_columns = sorted(
+        (
+            set(resolved_baseline_row.keys())
+            | set(resolved_offline_row.keys())
+            | set(resolved_online_row.keys())
+        )
+        - primary_keys
+    )
+
+    field_conflicts = []
+    auto_merged_columns = []
+    blocked_columns = []
+    export_applied = False
+    import_applied = False
+
+    for column_name in all_columns:
+        baseline_value = _get_sync_row_value(baseline_row, column_name)
+        offline_value = _get_sync_row_value(offline_row, column_name)
+        online_value = _get_sync_row_value(online_row, column_name)
+
+        structured_merge = _try_merge_structured_sync_column(
+            column_name,
+            baseline_value,
+            offline_value,
+            online_value,
+            allow_online_writes=allow_online_writes,
+        )
+        if structured_merge is not None:
+            _assign_sync_value(
+                resolved_offline_row,
+                column_name,
+                structured_merge["resolved_offline_value"],
+            )
+            _assign_sync_value(
+                resolved_online_row,
+                column_name,
+                structured_merge["resolved_online_value"],
+            )
+            _assign_sync_value(
+                resolved_baseline_row,
+                column_name,
+                structured_merge["resolved_baseline_value"],
+            )
+            field_conflicts.extend(structured_merge["field_conflicts"])
+            auto_merged_columns.extend(structured_merge["auto_merged_columns"])
+            blocked_columns.extend(structured_merge["blocked_columns"])
+            export_applied = export_applied or structured_merge["export_applied"]
+            import_applied = import_applied or structured_merge["import_applied"]
+            continue
+
+        if _sync_values_equal(offline_value, online_value):
+            _assign_sync_value(resolved_offline_row, column_name, offline_value)
+            _assign_sync_value(resolved_online_row, column_name, online_value)
+            _assign_sync_value(resolved_baseline_row, column_name, offline_value)
+            if not _sync_values_equal(baseline_value, offline_value):
+                auto_merged_columns.append(column_name)
+            continue
+
+        offline_column_changed = not _sync_values_equal(offline_value, baseline_value)
+        online_column_changed = not _sync_values_equal(online_value, baseline_value)
+
+        if offline_column_changed and not online_column_changed:
+            _assign_sync_value(resolved_offline_row, column_name, offline_value)
+            if allow_online_writes:
+                _assign_sync_value(resolved_online_row, column_name, offline_value)
+                _assign_sync_value(resolved_baseline_row, column_name, offline_value)
+                auto_merged_columns.append(column_name)
+                export_applied = True
+            else:
+                _assign_sync_value(resolved_online_row, column_name, online_value)
+                _assign_sync_value(resolved_baseline_row, column_name, baseline_value)
+                blocked_columns.append(column_name)
+            continue
+
+        if online_column_changed and not offline_column_changed:
+            _assign_sync_value(resolved_online_row, column_name, online_value)
+            _assign_sync_value(resolved_offline_row, column_name, online_value)
+            _assign_sync_value(resolved_baseline_row, column_name, online_value)
+            auto_merged_columns.append(column_name)
+            import_applied = True
+            continue
+
+        if offline_column_changed and online_column_changed:
+            field_conflicts.append(
+                _build_sync_field_conflict_entry(
+                    column_name,
+                    baseline_value,
+                    offline_value,
+                    online_value,
+                )
+            )
+            _assign_sync_value(resolved_offline_row, column_name, offline_value)
+            _assign_sync_value(resolved_online_row, column_name, online_value)
+            _assign_sync_value(resolved_baseline_row, column_name, baseline_value)
+            continue
+
+        _assign_sync_value(resolved_offline_row, column_name, offline_value)
+        _assign_sync_value(resolved_online_row, column_name, online_value)
+        _assign_sync_value(resolved_baseline_row, column_name, baseline_value)
+
+    if resolved_baseline_row:
+        for key_name, value in zip(_SYNC_PRIMARY_KEYS[table_name], identity):
+            resolved_baseline_row[key_name] = value
+        resolved_baseline_row = _normalize_row_for_sync(resolved_baseline_row)
+    else:
+        resolved_baseline_row = None
+
+    return {
+        "resolved_offline_row": _normalize_row_for_sync(resolved_offline_row),
+        "resolved_online_row": _normalize_row_for_sync(resolved_online_row),
+        "resolved_baseline_row": resolved_baseline_row,
+        "field_conflicts": field_conflicts,
+        "auto_merged_columns": sorted(set(auto_merged_columns)),
+        "blocked_columns": sorted(set(blocked_columns)),
+        "export_applied": export_applied,
+        "import_applied": import_applied,
+    }
+
+
+def _build_sync_item_entry(
+    table_name,
+    identity,
+    baseline_row,
+    offline_row,
+    online_row,
+    *,
+    reason,
+    changed_columns=None,
+    field_conflicts=None,
+    auto_merged_columns=None,
+):
     primary_keys = _SYNC_PRIMARY_KEYS[table_name]
     identity_dict = {
         key_name: value
@@ -1197,13 +1707,312 @@ def _build_sync_item_entry(table_name, identity, baseline_row, offline_row, onli
         "table": table_name,
         "item": _format_sync_item_label(table_name, identity),
         "identity": identity_dict,
-        "changed_columns": _detect_changed_columns(
-            baseline_row,
-            offline_row,
-            online_row,
+        "changed_columns": list(
+            changed_columns
+            if changed_columns is not None
+            else _detect_changed_columns(
+                baseline_row,
+                offline_row,
+                online_row,
+            )
         ),
+        "field_conflicts": list(field_conflicts or []),
+        "auto_merged_columns": list(auto_merged_columns or []),
         "reason": reason,
     }
+
+
+def _build_sync_field_conflict_entry(column_name, baseline_value, offline_value, online_value):
+    return {
+        "field": column_name,
+        "baseline_has_value": baseline_value is not _SYNC_VALUE_MISSING,
+        "baseline_value": None if baseline_value is _SYNC_VALUE_MISSING else baseline_value,
+        "offline_has_value": offline_value is not _SYNC_VALUE_MISSING,
+        "offline_value": None if offline_value is _SYNC_VALUE_MISSING else offline_value,
+        "online_has_value": online_value is not _SYNC_VALUE_MISSING,
+        "online_value": None if online_value is _SYNC_VALUE_MISSING else online_value,
+        "recommended_action": "export",
+        "recommended_label": "Exportar o valor offline",
+    }
+
+
+def _try_merge_structured_sync_column(
+    column_name,
+    baseline_value,
+    offline_value,
+    online_value,
+    *,
+    allow_online_writes,
+):
+    if not _looks_like_json_column(column_name):
+        return None
+
+    baseline_json = _parse_structured_sync_json_value(baseline_value)
+    offline_json = _parse_structured_sync_json_value(offline_value)
+    online_json = _parse_structured_sync_json_value(online_value)
+    if baseline_json is None or offline_json is None or online_json is None:
+        return None
+
+    merge_result = _merge_structured_sync_values(
+        path_prefix=column_name,
+        baseline_value=baseline_json,
+        offline_value=offline_json,
+        online_value=online_json,
+        allow_online_writes=allow_online_writes,
+    )
+    if merge_result is None:
+        return None
+
+    return {
+        "resolved_offline_value": _serialize_structured_sync_json_value(
+            merge_result["resolved_offline_value"]
+        ),
+        "resolved_online_value": _serialize_structured_sync_json_value(
+            merge_result["resolved_online_value"]
+        ),
+        "resolved_baseline_value": _serialize_structured_sync_json_value(
+            merge_result["resolved_baseline_value"]
+        ),
+        "field_conflicts": merge_result["field_conflicts"],
+        "auto_merged_columns": merge_result["auto_merged_columns"],
+        "blocked_columns": merge_result["blocked_columns"],
+        "export_applied": merge_result["export_applied"],
+        "import_applied": merge_result["import_applied"],
+    }
+
+
+def _looks_like_json_column(column_name):
+    normalized_name = str(column_name or "").lower()
+    return normalized_name.endswith("_json") or normalized_name == "raw_json"
+
+
+def _parse_structured_sync_json_value(raw_value):
+    if raw_value is _SYNC_VALUE_MISSING:
+        return _SYNC_VALUE_MISSING
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        parsed_value = json.loads(raw_value)
+    except Exception:
+        return None
+    if isinstance(parsed_value, dict):
+        return parsed_value
+    return None
+
+
+def _serialize_structured_sync_json_value(value):
+    if value is _SYNC_VALUE_MISSING:
+        return _SYNC_VALUE_MISSING
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _clone_structured_sync_value(value):
+    if value is _SYNC_VALUE_MISSING:
+        return _SYNC_VALUE_MISSING
+    if value is None:
+        return None
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _merge_structured_sync_values(
+    *,
+    path_prefix,
+    baseline_value,
+    offline_value,
+    online_value,
+    allow_online_writes,
+):
+    if not _can_merge_structured_sync_dicts(
+        baseline_value,
+        offline_value,
+        online_value,
+    ):
+        return None
+
+    resolved_offline_value = (
+        _clone_structured_sync_value(offline_value)
+        if isinstance(offline_value, dict)
+        else {}
+    )
+    resolved_online_value = (
+        _clone_structured_sync_value(online_value)
+        if isinstance(online_value, dict)
+        else {}
+    )
+    resolved_baseline_value = (
+        _clone_structured_sync_value(baseline_value)
+        if isinstance(baseline_value, dict)
+        else {}
+    )
+
+    field_conflicts = []
+    auto_merged_columns = []
+    blocked_columns = []
+    export_applied = False
+    import_applied = False
+
+    all_keys = sorted(
+        set((baseline_value or {}).keys())
+        | set((offline_value or {}).keys())
+        | set((online_value or {}).keys())
+    )
+
+    for key_name in all_keys:
+        next_path = f"{path_prefix}.{key_name}"
+        baseline_item = _get_nested_sync_value(baseline_value, key_name)
+        offline_item = _get_nested_sync_value(offline_value, key_name)
+        online_item = _get_nested_sync_value(online_value, key_name)
+
+        nested_result = _merge_structured_sync_values(
+            path_prefix=next_path,
+            baseline_value=baseline_item,
+            offline_value=offline_item,
+            online_value=online_item,
+            allow_online_writes=allow_online_writes,
+        )
+        if nested_result is not None:
+            _assign_nested_sync_value(
+                resolved_offline_value,
+                key_name,
+                nested_result["resolved_offline_value"],
+            )
+            _assign_nested_sync_value(
+                resolved_online_value,
+                key_name,
+                nested_result["resolved_online_value"],
+            )
+            _assign_nested_sync_value(
+                resolved_baseline_value,
+                key_name,
+                nested_result["resolved_baseline_value"],
+            )
+            field_conflicts.extend(nested_result["field_conflicts"])
+            auto_merged_columns.extend(nested_result["auto_merged_columns"])
+            blocked_columns.extend(nested_result["blocked_columns"])
+            export_applied = export_applied or nested_result["export_applied"]
+            import_applied = import_applied or nested_result["import_applied"]
+            continue
+
+        if _sync_values_equal(offline_item, online_item):
+            _assign_nested_sync_value(resolved_offline_value, key_name, offline_item)
+            _assign_nested_sync_value(resolved_online_value, key_name, online_item)
+            _assign_nested_sync_value(resolved_baseline_value, key_name, offline_item)
+            if not _sync_values_equal(baseline_item, offline_item):
+                auto_merged_columns.append(next_path)
+            continue
+
+        offline_changed = not _sync_values_equal(offline_item, baseline_item)
+        online_changed = not _sync_values_equal(online_item, baseline_item)
+
+        if offline_changed and not online_changed:
+            _assign_nested_sync_value(resolved_offline_value, key_name, offline_item)
+            if allow_online_writes:
+                _assign_nested_sync_value(resolved_online_value, key_name, offline_item)
+                _assign_nested_sync_value(resolved_baseline_value, key_name, offline_item)
+                auto_merged_columns.append(next_path)
+                export_applied = True
+            else:
+                _assign_nested_sync_value(resolved_online_value, key_name, online_item)
+                _assign_nested_sync_value(resolved_baseline_value, key_name, baseline_item)
+                blocked_columns.append(next_path)
+            continue
+
+        if online_changed and not offline_changed:
+            _assign_nested_sync_value(resolved_online_value, key_name, online_item)
+            _assign_nested_sync_value(resolved_offline_value, key_name, online_item)
+            _assign_nested_sync_value(resolved_baseline_value, key_name, online_item)
+            auto_merged_columns.append(next_path)
+            import_applied = True
+            continue
+
+        if offline_changed and online_changed:
+            field_conflicts.append(
+                _build_sync_field_conflict_entry(
+                    next_path,
+                    baseline_item,
+                    offline_item,
+                    online_item,
+                )
+            )
+            _assign_nested_sync_value(resolved_offline_value, key_name, offline_item)
+            _assign_nested_sync_value(resolved_online_value, key_name, online_item)
+            _assign_nested_sync_value(resolved_baseline_value, key_name, baseline_item)
+            continue
+
+        _assign_nested_sync_value(resolved_offline_value, key_name, offline_item)
+        _assign_nested_sync_value(resolved_online_value, key_name, online_item)
+        _assign_nested_sync_value(resolved_baseline_value, key_name, baseline_item)
+
+    resolved_baseline_value = (
+        resolved_baseline_value
+        if resolved_baseline_value
+        else _SYNC_VALUE_MISSING
+    )
+    return {
+        "resolved_offline_value": resolved_offline_value,
+        "resolved_online_value": resolved_online_value,
+        "resolved_baseline_value": resolved_baseline_value,
+        "field_conflicts": field_conflicts,
+        "auto_merged_columns": auto_merged_columns,
+        "blocked_columns": blocked_columns,
+        "export_applied": export_applied,
+        "import_applied": import_applied,
+    }
+
+
+def _can_merge_structured_sync_dicts(*values):
+    for value in values:
+        if value is _SYNC_VALUE_MISSING:
+            continue
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return False
+    return True
+
+
+def _get_nested_sync_value(container, key_name):
+    if not isinstance(container, dict):
+        return _SYNC_VALUE_MISSING
+    if key_name not in container:
+        return _SYNC_VALUE_MISSING
+    return container[key_name]
+
+
+def _assign_nested_sync_value(container, key_name, value):
+    if not isinstance(container, dict):
+        return
+    if value is _SYNC_VALUE_MISSING:
+        container.pop(key_name, None)
+        return
+    container[key_name] = value
+
+
+def _get_sync_row_value(row, column_name):
+    if not isinstance(row, dict):
+        return _SYNC_VALUE_MISSING
+    if column_name not in row:
+        return _SYNC_VALUE_MISSING
+    return row[column_name]
+
+
+def _assign_sync_value(row, column_name, value):
+    if row is None:
+        return
+    if value is _SYNC_VALUE_MISSING:
+        row.pop(column_name, None)
+        return
+    row[column_name] = value
+
+
+def _sync_values_equal(first_value, second_value):
+    if first_value is _SYNC_VALUE_MISSING or second_value is _SYNC_VALUE_MISSING:
+        return first_value is second_value
+    return first_value == second_value
 
 
 def _detect_changed_columns(baseline_row, offline_row, online_row):
@@ -1224,12 +2033,23 @@ def _detect_changed_columns(baseline_row, offline_row, online_row):
 
 def _build_conflict_message(conflicts):
     listed_items = [conflict.get("item") for conflict in conflicts[:3] if conflict.get("item")]
-    message = (
-        f"Desincronizacao detectada em {len(conflicts)} item(ns) com alteracao online e offline no mesmo registro"
+    field_conflict_count = sum(
+        len(conflict.get("field_conflicts") or [])
+        for conflict in conflicts
+        if isinstance(conflict, dict)
     )
+    message = (
+        f"Sobreposicao detectada em {len(conflicts)} item(ns)"
+    )
+    if field_conflict_count:
+        message += f" e {field_conflict_count} campo(s)"
     if listed_items:
         message += f": {', '.join(listed_items)}"
-    return message + ". Sugestao: verificar antes de forcar Importar ou Exportar."
+    return (
+        message
+        + ". O sistema manteve o valor offline no computador e o valor online no banco. "
+        "Revise os campos e escolha Importar ou Exportar para concluir."
+    )
 
 
 def _build_capacity_message(storage_status, blocked_count):
@@ -1300,6 +2120,15 @@ def _write_sync_payload_to_sqlite_files(project_root, payload: dict):
     database_dir = project_root / "database"
     database_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        from servidor_modules.database.storage import release_storage_handles
+
+        release_storage_handles(project_root)
+    except Exception:
+        pass
+
+    release_thread_connection(project_root)
+
     sqlite_path = get_database_path(project_root).resolve()
     sql_dump_path = (database_dir / "app-offline-backup.sql").resolve()
     temp_sqlite_path = (database_dir / "app.sqlite3.tmp").resolve()
@@ -1333,8 +2162,24 @@ def _write_sync_payload_to_sqlite_files(project_root, payload: dict):
     finally:
         sqlite_conn.close()
 
-    temp_sqlite_path.replace(sqlite_path)
-    temp_sql_dump_path.replace(sql_dump_path)
+    try:
+        temp_sqlite_path.replace(sqlite_path)
+    except PermissionError:
+        _overwrite_existing_sqlite_database(temp_sqlite_path, sqlite_path)
+        try:
+            temp_sqlite_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    try:
+        temp_sql_dump_path.replace(sql_dump_path)
+    except PermissionError:
+        shutil.copyfile(temp_sql_dump_path, sql_dump_path)
+        try:
+            temp_sql_dump_path.unlink()
+        except FileNotFoundError:
+            pass
+
     return {
         "sqlite_path": str(sqlite_path),
         "sql_dump_path": str(sql_dump_path),
@@ -1356,6 +2201,20 @@ def _refresh_sql_dump_from_existing_sqlite(project_root) -> Path:
 
     temp_sql_dump_path.replace(sql_dump_path)
     return sql_dump_path
+
+
+def _overwrite_existing_sqlite_database(source_path: Path, target_path: Path) -> None:
+    source_conn = sqlite3.connect(str(source_path))
+    target_conn = sqlite3.connect(str(target_path))
+    try:
+        target_conn.execute("PRAGMA foreign_keys = OFF")
+        source_conn.backup(target_conn)
+        target_conn.commit()
+    finally:
+        try:
+            source_conn.close()
+        finally:
+            target_conn.close()
 
 
 def _write_sync_payload_to_sqlite_connection(sqlite_conn, payload: dict) -> dict[str, int]:
@@ -1400,7 +2259,18 @@ def _write_sync_payload_to_postgres(conn, payload: dict) -> dict[str, int]:
                     table_counts[table_name] = 0
                     continue
 
-                column_names = list(rows[0].keys())
+                available_columns = _get_postgres_table_columns(conn, table_name)
+                if available_columns:
+                    column_names = [
+                        column for column in rows[0].keys() if column in available_columns
+                    ]
+                else:
+                    column_names = list(rows[0].keys())
+
+                if not column_names:
+                    table_counts[table_name] = 0
+                    continue
+
                 quoted_columns = ", ".join(_quote_identifier(column) for column in column_names)
                 placeholders = ", ".join(["%s"] * len(column_names))
                 cursor.executemany(
@@ -1492,6 +2362,93 @@ class DatabaseConnectionProxy:
             self._local.conn = None
 
 
+class SQLiteCursorProxy:
+    def __init__(self, cursor, row_factory=None):
+        self._cursor = cursor
+        self._row_factory = row_factory
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+        return False
+
+    def execute(self, query, params=None):
+        self._cursor.execute(str(query), params or ())
+        return self
+
+    def executemany(self, query, params_seq):
+        self._cursor.executemany(str(query), params_seq)
+        return self
+
+    def _convert_row(self, row):
+        if row is None:
+            return None
+        if self._row_factory is dict_row and isinstance(row, sqlite3.Row):
+            return {key: row[key] for key in row.keys()}
+        return row
+
+    def fetchone(self):
+        return self._convert_row(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._convert_row(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self._cursor:
+            yield self._convert_row(row)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class SQLiteConnectionProxy:
+    is_sqlite = True
+
+    def __init__(self, sqlite_path: Path):
+        self.sqlite_path = Path(sqlite_path)
+        self._local = threading.local()
+
+    def _get_or_acquire(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.sqlite_path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
+
+    def cursor(self, *args, **kwargs):
+        row_factory = kwargs.pop("row_factory", dict_row)
+        return SQLiteCursorProxy(self._get_or_acquire().cursor(*args, **kwargs), row_factory=row_factory)
+
+    def execute(self, query, params=None):
+        cursor = self.cursor()
+        cursor.execute(query, params)
+        return cursor
+
+    def commit(self):
+        self._get_or_acquire().commit()
+
+    def rollback(self):
+        try:
+            self._get_or_acquire().rollback()
+        except Exception:
+            pass
+
+    def release(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        finally:
+            self._local.conn = None
+
+
 def _initialize_database(project_root, root_key: str) -> None:
     init_lock = _INITIALIZATION_LOCKS.setdefault(root_key, threading.Lock())
     with init_lock:
@@ -1515,13 +2472,34 @@ def _execute_statements(conn, sql_script: str) -> None:
 
 def has_empresas_numero_cliente_column(project_root=None, conn=None) -> bool:
     root_key = None
+    backend_key = "auto"
     if project_root is not None:
         root_key = str(Path(project_root).resolve())
-        cached = _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE.get(root_key)
+    connection = conn or get_connection(project_root)
+    if getattr(connection, "is_sqlite", False) or isinstance(connection, sqlite3.Connection):
+        backend_key = "sqlite"
+    else:
+        backend_key = "postgres"
+
+    cache_key = (root_key, backend_key) if root_key is not None else None
+    if cache_key is not None:
+        cached = _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE.get(cache_key)
         if cached is not None:
             return bool(cached)
 
-    connection = conn or get_connection(project_root)
+    if getattr(connection, "is_sqlite", False) or isinstance(connection, sqlite3.Connection):
+        with connection.cursor() as cursor:
+            cursor.execute('PRAGMA table_info("empresas")')
+            rows = cursor.fetchall()
+        has_column = any(
+            str((row.get("name") if isinstance(row, dict) else row["name"]) or "").strip()
+            == "ultimo_numero_cliente"
+            for row in rows
+        )
+        if cache_key is not None:
+            _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE[cache_key] = has_column
+        return has_column
+
     with connection.cursor(row_factory=dict_row) as cursor:
         cursor.execute(
             """
@@ -1538,8 +2516,8 @@ def has_empresas_numero_cliente_column(project_root=None, conn=None) -> bool:
         row = cursor.fetchone()
 
     has_column = bool(row and row.get("has_column"))
-    if root_key is not None:
-        _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE[root_key] = has_column
+    if cache_key is not None:
+        _EMPRESAS_NUMERO_CLIENTE_COLUMN_CACHE[cache_key] = has_column
     return has_column
 
 
@@ -1771,6 +2749,25 @@ def _postgres_table_exists(conn, table_name: str) -> bool:
         cursor.execute("SELECT to_regclass(%s) AS regclass", (table_name,))
         row = cursor.fetchone()
         return bool(row and row["regclass"])
+
+
+def _get_postgres_table_columns(conn, table_name: str) -> set[str]:
+    with conn.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (str(table_name),),
+        )
+        rows = cursor.fetchall() or []
+    return {
+        str((row or {}).get("column_name") or "").strip()
+        for row in rows
+        if str((row or {}).get("column_name") or "").strip()
+    }
 
 
 def _create_table_from_sqlite_definition(conn, table: SQLiteTable) -> None:

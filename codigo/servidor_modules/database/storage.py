@@ -5,17 +5,29 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from copy import deepcopy
 from pathlib import Path
 
 from servidor_modules.database.connection import (
+    SQLiteConnectionProxy,
+    clear_recent_online_failure,
+    evaluate_storage_guard,
+    ensure_local_sqlite_database,
     get_connection,
     has_empresas_numero_cliente_column,
+    has_pending_local_offline_changes,
+    has_recent_online_failure,
+    mark_local_offline_change,
+    refresh_local_sql_dump,
 )
 
 
 _STORAGES = {}
 _STORAGES_LOCK = threading.Lock()
+_LAST_STORAGE_MODE_LOG = {}
+_CONNECTION_MODE_CACHE = {}
+_CONNECTION_MODE_CACHE_TTL_SECONDS = 3.0
 
 
 DEFAULT_DOCUMENTS = {
@@ -134,7 +146,8 @@ class DatabaseStorage:
         self.project_root = Path(project_root)
         self.json_dir = self.project_root / "json"
         self.json_dir.mkdir(parents=True, exist_ok=True)
-        self.conn = get_connection(self.project_root)
+        self.conn = self._create_storage_connection()
+        self._log_active_storage_mode()
         self._lock = threading.RLock()
         self._bootstrapped = False
         self._mirror_to_disk = (
@@ -142,7 +155,136 @@ class DatabaseStorage:
             in {"1", "true", "yes", "on"}
         )
 
+    def refresh_connection_mode(self):
+        with self._lock:
+            root_key = str(self.project_root.resolve())
+            cache_entry = _CONNECTION_MODE_CACHE.get(root_key) or {}
+            now = time.monotonic()
+            if (
+                cache_entry.get("conn") is self.conn
+                and (now - float(cache_entry.get("checked_at") or 0.0))
+                < _CONNECTION_MODE_CACHE_TTL_SECONDS
+            ):
+                return self.conn
+
+            currently_online = not getattr(self.conn, "is_sqlite", False)
+            pending_local_changes = has_pending_local_offline_changes(self.project_root)
+            recent_online_failure = has_recent_online_failure(self.project_root)
+            should_use_local = pending_local_changes or recent_online_failure
+            online_conn = None
+
+            if currently_online and not pending_local_changes:
+                try:
+                    storage_guard = evaluate_storage_guard(
+                        self.project_root,
+                        conn=self.conn,
+                    )
+                    if not storage_guard.get("forced_offline"):
+                        clear_recent_online_failure(self.project_root)
+                        _CONNECTION_MODE_CACHE[root_key] = {
+                            "conn": self.conn,
+                            "checked_at": now,
+                        }
+                        return self.conn
+                    should_use_local = True
+                except Exception:
+                    clear_recent_online_failure(self.project_root)
+                    _CONNECTION_MODE_CACHE[root_key] = {
+                        "conn": self.conn,
+                        "checked_at": now,
+                    }
+                    return self.conn
+
+            if not should_use_local:
+                try:
+                    online_conn = get_connection(
+                        self.project_root,
+                        wait_timeout_seconds=float(
+                            os.environ.get("DATABASE_STORAGE_BOOT_TIMEOUT_SECONDS", "2")
+                        ),
+                    )
+                    storage_guard = evaluate_storage_guard(
+                        self.project_root,
+                        conn=online_conn,
+                    )
+                    should_use_local = bool(storage_guard.get("forced_offline"))
+                except Exception:
+                    should_use_local = True
+
+            if should_use_local:
+                if not getattr(self.conn, "is_sqlite", False):
+                    try:
+                        self.conn.release()
+                    except Exception:
+                        pass
+                    self.conn = SQLiteConnectionProxy(
+                        ensure_local_sqlite_database(self.project_root)
+                    )
+                    self._log_active_storage_mode()
+                _CONNECTION_MODE_CACHE[root_key] = {
+                    "conn": self.conn,
+                    "checked_at": now,
+                }
+                return self.conn
+
+            if getattr(self.conn, "is_sqlite", False):
+                try:
+                    self.conn.release()
+                except Exception:
+                    pass
+                self.conn = online_conn or get_connection(
+                    self.project_root,
+                    wait_timeout_seconds=float(
+                        os.environ.get("DATABASE_STORAGE_BOOT_TIMEOUT_SECONDS", "2")
+                    ),
+                )
+                self._log_active_storage_mode()
+
+            _CONNECTION_MODE_CACHE[root_key] = {
+                "conn": self.conn,
+                "checked_at": now,
+            }
+            return self.conn
+
+    def _create_storage_connection(self):
+        if has_recent_online_failure(self.project_root) or has_pending_local_offline_changes(
+            self.project_root
+        ):
+            sqlite_path = ensure_local_sqlite_database(self.project_root)
+            return SQLiteConnectionProxy(sqlite_path)
+
+        try:
+            storage_boot_timeout = float(
+                os.environ.get("DATABASE_STORAGE_BOOT_TIMEOUT_SECONDS", "2")
+            )
+            return get_connection(
+                self.project_root,
+                wait_timeout_seconds=storage_boot_timeout,
+            )
+        except Exception:
+            sqlite_path = ensure_local_sqlite_database(self.project_root)
+            return SQLiteConnectionProxy(sqlite_path)
+
+    def _log_active_storage_mode(self):
+        root_key = str(self.project_root.resolve())
+        using_local_database = bool(getattr(self.conn, "is_sqlite", False))
+        pending_offline_changes = has_pending_local_offline_changes(self.project_root)
+
+        if using_local_database and pending_offline_changes:
+            message = " Base ativa: offline local (alteracoes offline pendentes)."
+        elif using_local_database:
+            message = " Base ativa: offline local (SQLite)."
+        else:
+            message = " Base ativa: online (PostgreSQL)."
+
+        if _LAST_STORAGE_MODE_LOG.get(root_key) == message:
+            return
+
+        _LAST_STORAGE_MODE_LOG[root_key] = message
+        print(message)
+
     def _supports_empresas_numero_cliente_column(self):
+        self.refresh_connection_mode()
         return has_empresas_numero_cliente_column(
             project_root=self.project_root,
             conn=self.conn,
@@ -153,6 +295,7 @@ class DatabaseStorage:
 
     def ensure_bootstrap(self):
         with self._lock:
+            self.refresh_connection_mode()
             if self._bootstrapped:
                 return
 
@@ -167,6 +310,7 @@ class DatabaseStorage:
             self._bootstrapped = True
 
     def load_document(self, name, default_payload=None):
+        self.refresh_connection_mode()
         self.ensure_bootstrap()
         if name == "dados.json":
             return self._load_dados_document(default_payload)
@@ -181,6 +325,7 @@ class DatabaseStorage:
         raise ValueError(f"Documento nao suportado: {name}")
 
     def save_document(self, name, payload):
+        self.refresh_connection_mode()
         self.ensure_bootstrap()
         self._save_document_internal(name, payload, mirror_to_disk=self._mirror_to_disk)
         return True
@@ -256,6 +401,11 @@ class DatabaseStorage:
                 self.conn.rollback()
                 raise
 
+        if getattr(self.conn, "is_sqlite", False):
+            refresh_local_sql_dump(self.project_root)
+            if name in {"dados.json", "backup.json"}:
+                mark_local_offline_change(self.project_root, source=f"storage:{name}")
+
         if mirror_to_disk:
             self._write_snapshot(name, payload)
 
@@ -316,15 +466,26 @@ class DatabaseStorage:
         return [json.loads(row["raw_json"]) for row in rows]
 
     def _load_empresas(self):
-        if self._supports_empresas_numero_cliente_column():
-            rows = self.conn.execute(
-                """
-                SELECT raw_json, ultimo_numero_cliente
-                FROM empresas
-                ORDER BY sort_order, codigo
-                """
-            ).fetchall()
-        else:
+        try:
+            if self._supports_empresas_numero_cliente_column():
+                rows = self.conn.execute(
+                    """
+                    SELECT raw_json, ultimo_numero_cliente
+                    FROM empresas
+                    ORDER BY sort_order, codigo
+                    """
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT raw_json, 0 AS ultimo_numero_cliente
+                    FROM empresas
+                    ORDER BY sort_order, codigo
+                    """
+                ).fetchall()
+        except Exception as exc:
+            if "ultimo_numero_cliente" not in str(exc):
+                raise
             rows = self.conn.execute(
                 """
                 SELECT raw_json, 0 AS ultimo_numero_cliente
@@ -574,4 +735,20 @@ def get_storage(project_root):
         if storage is None:
             storage = DatabaseStorage(project_root)
             _STORAGES[root_key] = storage
-        return storage
+    storage.refresh_connection_mode()
+    return storage
+
+
+def release_storage_handles(project_root) -> None:
+    root_key = str(Path(project_root).resolve())
+    with _STORAGES_LOCK:
+        storage = _STORAGES.get(root_key)
+
+    if storage is None:
+        return
+
+    with storage._lock:
+        try:
+            storage.conn.release()
+        except Exception:
+            pass

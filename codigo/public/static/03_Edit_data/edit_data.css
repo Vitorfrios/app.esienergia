@@ -43,6 +43,56 @@
     justify-content: center;
 }
 
+.toolbar-right {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.system-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.7rem 0.95rem;
+    border-radius: 999px;
+    font-size: 0.92rem;
+    font-weight: 700;
+    border: 1px solid transparent;
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.system-status-badge.online {
+    background: #ecfdf5;
+    color: #166534;
+    border-color: #bbf7d0;
+}
+
+.system-status-badge.offline {
+    background: #fff7ed;
+    color: #c2410c;
+    border-color: #fed7aa;
+}
+
+.system-status-dot {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.6);
+}
+
+.offline-sync-notice {
+    margin-bottom: var(--spacing-md);
+    padding: 0.8rem 1rem;
+    border-radius: var(--border-radius);
+    background: #fff8e1;
+    color: #8a5800;
+    border: 1px solid #f4d47c;
+    font-size: 0.92rem;
+    line-height: 1.45;
+}
+
 
 
 .search-box {

@@ -1,6 +1,9 @@
 /* ==== INÍCIO: button-delete-universal.js ==== */
 
-import { removeObraFromRuntimeBootstrap } from "../../core/runtime-data.js";
+import {
+  getObraCatalogRuntimeData,
+  removeObraFromRuntimeBootstrap,
+} from "../../core/runtime-data.js";
 
 class ButtonDeleteUniversal {
   constructor() {
@@ -213,6 +216,26 @@ class ButtonDeleteUniversal {
     }
   }
 
+  async obraExisteNoSistema(obraId) {
+    const tentativas = [{}, { forceReload: true }];
+
+    for (const options of tentativas) {
+      try {
+        const catalogo = await getObraCatalogRuntimeData(options);
+        const existe = Array.isArray(catalogo)
+          && catalogo.some((obra) => String(obra?.id || "").trim() === String(obraId).trim());
+
+        if (existe) {
+          return true;
+        }
+      } catch (error) {
+        console.warn(" [DELETE-REAL] Falha ao verificar existencia da obra:", error);
+      }
+    }
+
+    return false;
+  }
+
   /**
    * Executa deleção da obra
    */
@@ -225,6 +248,16 @@ class ButtonDeleteUniversal {
     if (!obraId) {
       this.showToast("ID da obra inválido para exclusão", "error");
       return false;
+    }
+
+    const obraExisteNoSistema = await this.obraExisteNoSistema(obraId);
+    if (!obraExisteNoSistema) {
+      removeObraFromRuntimeBootstrap(obraId);
+      if (window.FilterSystem?.notifyObraDeleted) {
+        window.FilterSystem.notifyObraDeleted(obraId);
+      }
+      this.removeElementFromDOM(buttonInfo);
+      return true;
     }
 
     if (this.inFlightDeletions.has(obraId)) {
@@ -267,10 +300,12 @@ class ButtonDeleteUniversal {
         }
 
         this.removeElementFromDOM(buttonInfo);
-        this.showToast(
-          `Obra "${itemName}" deletada permanentemente`,
-          "success",
-        );
+        if (!result.already_deleted) {
+          this.showToast(
+            `Obra "${itemName}" deletada permanentemente`,
+            "success",
+          );
+        }
 
         if (typeof window.invalidateRuntimeBootstrap === "function") {
           window.invalidateRuntimeBootstrap();

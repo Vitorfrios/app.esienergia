@@ -4,6 +4,11 @@
  * =====================
  */
 
+import {
+  getObraCatalogRuntimeData,
+  removeObraFromRuntimeBootstrap,
+} from "../../../core/runtime-data.js";
+
 // Variáveis globais para controle do modal e undo
 let pendingDeletion = {
   obraName: null,
@@ -465,43 +470,21 @@ async function completeDeletionImmediate(obraId, obraName) {
 async function verificarObraNoServidor(obraId) {
   try {
     console.log(` Verificando se obra ${obraId} existe no servidor...`);
-    {
-      const obraResponse = await fetch(`/obras/${encodeURIComponent(obraId)}`);
-      if (obraResponse.status === 404) {
-        return false;
-      }
+    const tentativas = [{}, { forceReload: true }];
 
-      if (!obraResponse.ok) {
-        console.log(" Nao foi possivel verificar a obra no servidor");
-        return false;
-      }
+    for (const options of tentativas) {
+      const todasObras = await getObraCatalogRuntimeData(options);
+      const obraExiste = Array.isArray(todasObras)
+        && todasObras.some((obra) => String(obra?.id || "") === String(obraId));
 
-      console.log(` Obra ${obraId} existe no servidor? true`);
-      return true;
+      if (obraExiste) {
+        console.log(` Obra ${obraId} existe no servidor? true`);
+        return true;
+      }
     }
 
-    // Buscar todas as obras do servidor
-    const response = await fetch("/api/obras/catalog");
-    if (!response.ok) {
-      console.log(" Não foi possível verificar obras no servidor");
-      return false;
-    }
-
-    const backupData = await response.json();
-    const todasObras = backupData.obras || [];
-
-    // Verificar se a obra existe
-    const obraExiste = todasObras.some(
-      (obra) => String(obra.id) === String(obraId),
-    );
-
-    console.log(` Obra ${obraId} existe no servidor? ${obraExiste}`);
-    console.log(
-      ` Obras no servidor:`,
-      todasObras.map((o) => ({ id: o.id, nome: o.nome })),
-    );
-
-    return obraExiste;
+    console.log(` Obra ${obraId} existe no servidor? false`);
+    return false;
   } catch (error) {
     console.log(` Erro ao verificar obra no servidor:`, error.message);
     return false;
@@ -529,6 +512,38 @@ export async function confirmDeletion() {
   }
 
   console.log(` Confirmando deleção da obra: ${obraName} (ID: ${obraId})`);
+
+  const obraExisteNoServidor = await verificarObraNoServidor(obraId);
+  if (!obraExisteNoServidor) {
+    closeConfirmationModalWithoutClearing();
+
+    if (obraBlock) {
+      obraBlock.style.transition = "all 0.5s ease";
+      obraBlock.style.transform = "translateX(-100%)";
+      obraBlock.style.opacity = "0";
+
+      setTimeout(() => {
+        if (obraBlock.parentNode) {
+          obraBlock.remove();
+          console.log(` Obra ${obraName} (ID: ${obraId}) removida apenas da tela`);
+        }
+      }, 62);
+    }
+
+    removeObraFromRuntimeBootstrap(obraId);
+    if (window.FilterSystem?.notifyObraDeleted) {
+      window.FilterSystem.notifyObraDeleted(obraId);
+    }
+    sessionStorage.removeItem(`pendingDeletion-${obraId}`);
+    pendingDeletion = {
+      obraName: null,
+      obraId: null,
+      obraBlock: null,
+      obraHTML: null,
+      originalPosition: null,
+    };
+    return;
+  }
 
   // Salva dados específicos para esta obra (para permitir undo independente)
   sessionStorage.setItem(

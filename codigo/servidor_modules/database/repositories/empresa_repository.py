@@ -5,21 +5,34 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 
-from servidor_modules.database.connection import has_empresas_numero_cliente_column
+from servidor_modules.database.connection import (
+    has_empresas_numero_cliente_column,
+    mark_local_offline_change,
+    refresh_local_sql_dump,
+)
 from servidor_modules.database.storage import get_storage, normalize_empresa
 
 
 class EmpresaRepository:
     def __init__(self, project_root):
         self.storage = get_storage(project_root)
-        self.conn = self.storage.conn
         self.project_root = self.storage.project_root
+
+    @property
+    def conn(self):
+        self.storage.refresh_connection_mode()
+        return self.storage.conn
 
     def _supports_numero_cliente_column(self):
         return has_empresas_numero_cliente_column(
             project_root=self.project_root,
             conn=self.conn,
         )
+
+    def _sync_local_offline_sidecars(self, source):
+        if getattr(self.conn, "is_sqlite", False):
+            refresh_local_sql_dump(self.project_root)
+            mark_local_offline_change(self.project_root, source=source)
 
     @staticmethod
     def _normalize_numero_cliente_atual(value):
@@ -101,15 +114,26 @@ class EmpresaRepository:
             raise
 
     def get_all(self):
-        if self._supports_numero_cliente_column():
-            rows = self.conn.execute(
-                """
-                SELECT raw_json, ultimo_numero_cliente
-                FROM empresas
-                ORDER BY sort_order, codigo
-                """
-            ).fetchall()
-        else:
+        try:
+            if self._supports_numero_cliente_column():
+                rows = self.conn.execute(
+                    """
+                    SELECT raw_json, ultimo_numero_cliente
+                    FROM empresas
+                    ORDER BY sort_order, codigo
+                    """
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT raw_json, 0 AS ultimo_numero_cliente
+                    FROM empresas
+                    ORDER BY sort_order, codigo
+                    """
+                ).fetchall()
+        except Exception as exc:
+            if "ultimo_numero_cliente" not in str(exc):
+                raise
             rows = self.conn.execute(
                 """
                 SELECT raw_json, 0 AS ultimo_numero_cliente
@@ -276,6 +300,7 @@ class EmpresaRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("empresas:replace-all")
         self._refresh_last_numero_cliente(incoming_codes if incoming_codes else None)
         return self.get_all()
 
@@ -448,16 +473,28 @@ class EmpresaRepository:
         return True
 
     def get_by_codigo(self, codigo):
-        if self._supports_numero_cliente_column():
-            row = self.conn.execute(
-                """
-                SELECT raw_json, ultimo_numero_cliente
-                FROM empresas
-                WHERE codigo = ?
-                """,
-                (str(codigo),),
-            ).fetchone()
-        else:
+        try:
+            if self._supports_numero_cliente_column():
+                row = self.conn.execute(
+                    """
+                    SELECT raw_json, ultimo_numero_cliente
+                    FROM empresas
+                    WHERE codigo = ?
+                    """,
+                    (str(codigo),),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """
+                    SELECT raw_json, 0 AS ultimo_numero_cliente
+                    FROM empresas
+                    WHERE codigo = ?
+                    """,
+                    (str(codigo),),
+                ).fetchone()
+        except Exception as exc:
+            if "ultimo_numero_cliente" not in str(exc):
+                raise
             row = self.conn.execute(
                 """
                 SELECT raw_json, 0 AS ultimo_numero_cliente
@@ -548,5 +585,6 @@ class EmpresaRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("empresas:upsert")
         self._refresh_last_numero_cliente([codigo])
         return empresa_normalizada

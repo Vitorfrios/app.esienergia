@@ -8,7 +8,7 @@
     <title>Admin | Dados | Sistema ESI</title>
     <link rel="icon" type="image/png" href="https://esienergia.com.br/wp-content/uploads/2024/02/favicon5.png">
     <link rel="stylesheet" href="/public/dist/obra-app.min.css?v=20260323-3">
-    <link rel="stylesheet" href="/public/dist/admin-data.min.css?v=20260323-3">
+    <link rel="stylesheet" href="/public/dist/admin-data.min.css?v=20260408-4">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
 </head>
 
@@ -55,10 +55,15 @@
                 <button class="btn btn-warning" id="exportOfflineDatabaseBtn" onclick="exportOfflineToOnline()">
                     <i class="icon-upload"></i> Exportar
                 </button>
-
-
+            </div>
+            <div class="toolbar-right">
+                <div id="systemStatusBadge" class="system-status-badge offline">
+                    <span class="system-status-dot"></span>
+                    <span id="systemStatusText">Sistema offline</span>
+                </div>
             </div>
         </div>
+        <div id="offlineSyncNotice" class="offline-sync-notice" style="display: none;"></div>
 
 
         <!-- Tabs de Navegação -->
@@ -72,7 +77,6 @@
             <button class="tab" onclick="switchTab('acessories')">Acessórios</button>
             <button class="tab" onclick="switchTab('dutos')">Dutos</button>
             <button class="tab" onclick="switchTab('tubos')">Tubos</button>
-            <button class="tab" onclick="switchTab('raw')">JSON Bruto</button>
         </div>
 
         <!-- Conteúdo das Tabs -->
@@ -313,25 +317,6 @@
                 </div>
 
             </div>
-            <!-- Tab JSON Bruto -->
-            <div id="rawTab" class="tab-pane">
-                <div class="tab-header">
-                    <h2><i class="icon-code"></i> JSON Completo</h2>
-                    <div class="json-header-actions">
-                        <button id="copyJsonButton" class="btn btn-small btn-info" onclick="copyJSONToClipboard(this)">
-                            Copiar JSON
-                        </button>
-                    </div>
-                </div>
-
-                <div class="json-container">
-                    <!-- Visualizador JSON -->
-                    <div class="json-editor-wrapper">
-                        <textarea id="jsonEditor" spellcheck="false" readonly aria-label="Visualizador JSON"></textarea>
-                    </div>
-                </div>
-
-            </div>
 
         </div>
 
@@ -357,6 +342,14 @@
                 <div class="modal-actions">
                     <button class="btn btn-success" onclick="saveEdit()">Salvar</button>
                     <button class="btn btn-secondary" onclick="closeEditModal()">Cancelar</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="offlineConflictModal" class="modal">
+            <div class="modal-content offline-conflict-modal">
+                <div id="offlineConflictModalContent">
+                    <!-- Conteúdo dinâmico -->
                 </div>
             </div>
         </div>
@@ -413,7 +406,7 @@
             <i class="fa-brands fa-github"></i> Vitor Rios on GitHub
         </a>
     </footer>
-    <script defer src="/public/dist/admin-data.min.js?v=20260402-2"></script>
+    <script defer src="/public/dist/admin-data.min.js?v=20260408-9"></script>
     <script>
         // Função para destacar e travar apenas o clique da página ativa
         function highlightAndLockActivePage() {

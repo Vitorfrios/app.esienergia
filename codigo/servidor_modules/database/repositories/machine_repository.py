@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import json
 
+from servidor_modules.database.connection import (
+    mark_local_offline_change,
+    refresh_local_sql_dump,
+)
 from servidor_modules.database.storage import get_storage
 
 
 class MachineRepository:
     def __init__(self, project_root):
         self.storage = get_storage(project_root)
-        self.conn = self.storage.conn
+        self.project_root = self.storage.project_root
+
+    @property
+    def conn(self):
+        self.storage.refresh_connection_mode()
+        return self.storage.conn
+
+    def _sync_local_offline_sidecars(self, source):
+        if getattr(self.conn, "is_sqlite", False):
+            refresh_local_sql_dump(self.project_root)
+            mark_local_offline_change(self.project_root, source=source)
 
     def get_all(self):
         rows = self.conn.execute(
@@ -55,6 +69,7 @@ class MachineRepository:
         except Exception:
             self.conn.rollback()
             raise
+        self._sync_local_offline_sidecars("machines:replace-all")
         return self.get_all()
 
     def add(self, machine):
