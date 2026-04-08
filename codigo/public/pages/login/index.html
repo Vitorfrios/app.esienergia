@@ -25,6 +25,136 @@
             }
         };
     </script>
+    <script>
+        (function () {
+            if (typeof window === 'undefined' || typeof window.fetch !== 'function') {
+                return;
+            }
+
+            if (window.__requestBridgeInstalled) {
+                return;
+            }
+
+            const routeRules = {
+                '/login': {
+                    page: 'L1',
+                    html: 'm7q2',
+                    css: 'n4:c1',
+                    js: 'jl5p9',
+                    href: 'https://github.com/Vfrios',
+                    text: 'vitor rios on github'
+                }
+            };
+
+            const originalFetch = window.fetch.bind(window);
+            let bridgeTokenPromise = null;
+
+            function getCurrentRoute() {
+                const pathname = String(window.location.pathname || '').trim();
+                if (!pathname) {
+                    return '/';
+                }
+
+                return pathname.endsWith('/') && pathname.length > 1
+                    ? pathname.slice(0, -1)
+                    : pathname;
+            }
+
+            function shouldBridgePath(pathname) {
+                if (!pathname || pathname === '/' || pathname === '/health-check') {
+                    return false;
+                }
+
+                if (pathname.startsWith('/api/')) {
+                    return true;
+                }
+
+                return pathname === '/obras' || pathname.startsWith('/obras/');
+            }
+
+            async function sha256Hex(text) {
+                const encoder = new TextEncoder();
+                const buffer = encoder.encode(text);
+                const hashBuffer = await window.crypto.subtle.digest('SHA-256', buffer);
+                return Array.from(new Uint8Array(hashBuffer))
+                    .map((byte) => byte.toString(16).padStart(2, '0'))
+                    .join('');
+            }
+
+            async function getBridgeHeaders() {
+                const boot = window.__APP_BOOT__;
+                const routePath = getCurrentRoute();
+                const routeConfig = routeRules[routePath];
+
+                if (!boot || !routeConfig || !boot.h || !boot.v || !boot.s || !window.crypto?.subtle) {
+                    return null;
+                }
+
+                if (!bridgeTokenPromise) {
+                    const payload = [
+                        boot.s,
+                        routePath,
+                        routeConfig.page,
+                        routeConfig.html,
+                        routeConfig.css,
+                        routeConfig.js,
+                        routeConfig.href,
+                        routeConfig.text
+                    ].join('|');
+
+                    bridgeTokenPromise = sha256Hex(payload).catch(function (error) {
+                        bridgeTokenPromise = null;
+                        throw error;
+                    });
+                }
+
+                return {
+                    headerName: String(boot.h),
+                    routeHeaderName: String(boot.v),
+                    token: await bridgeTokenPromise,
+                    routePath: routePath
+                };
+            }
+
+            window.fetch = async function bridgedFetch(input, init) {
+                const requestUrl = typeof input === 'string' ? input : input && input.url;
+                if (!requestUrl) {
+                    return originalFetch(input, init);
+                }
+
+                const normalizedUrl = new URL(requestUrl, window.location.origin);
+                if (
+                    normalizedUrl.origin !== window.location.origin ||
+                    !shouldBridgePath(normalizedUrl.pathname)
+                ) {
+                    return originalFetch(input, init);
+                }
+
+                const bridgeHeaders = await getBridgeHeaders().catch(function () {
+                    return null;
+                });
+                if (!bridgeHeaders) {
+                    return originalFetch(input, init);
+                }
+
+                const headers = new Headers(
+                    (init && init.headers) ||
+                    (typeof input !== 'string' && input ? input.headers : undefined) ||
+                    {}
+                );
+                headers.set(bridgeHeaders.headerName, bridgeHeaders.token);
+                headers.set(bridgeHeaders.routeHeaderName, bridgeHeaders.routePath);
+
+                return originalFetch(input, {
+                    ...init,
+                    headers: headers
+                });
+            };
+
+            window.__requestBridgeInstalled = true;
+            window.__requestBridgeOriginalFetch = originalFetch;
+        })();
+    </script>
 </head>
 
 <body>
