@@ -2,6 +2,7 @@
 import "./config/request-bridge.js";
 import { createSmartLogger } from "../01_Create_Obra/core/logger.js";
 import "../01_Create_Obra/core/system-bootstrap.js";
+import { shutdownManual } from "../01_Create_Obra/data/adapters/shutdown-adapter.js";
 import { pendingChanges, hasRealChanges } from "./config/state.js";
 import { saveDataSilently } from "./config/api.js";
 import "./config/ui.js";
@@ -31,6 +32,8 @@ window.toggleSystemLogger = function (enable = null) {
 };
 
 // Função para garantir que systemData tenha estrutura completa
+window.shutdownManual = shutdownManual;
+
 function normalizeADMData(admData, legacyAdministradores = null) {
   const source = admData ?? legacyAdministradores;
 

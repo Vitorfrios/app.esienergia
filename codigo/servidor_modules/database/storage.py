@@ -714,12 +714,25 @@ class DatabaseStorage:
             )
 
     def _sync_sessions(self, cursor, payload):
-        cursor.execute("DELETE FROM sessions")
-        for session_id, session_payload in normalize_sessions_payload(payload).get("sessions", {}).items():
+        normalized_sessions = normalize_sessions_payload(payload).get("sessions", {})
+        session_ids = [str(session_id) for session_id in normalized_sessions.keys()]
+
+        if session_ids:
+            placeholders = ", ".join(["?"] * len(session_ids))
+            cursor.execute(
+                f"DELETE FROM sessions WHERE session_id NOT IN ({placeholders})",
+                session_ids,
+            )
+        else:
+            cursor.execute("DELETE FROM sessions")
+
+        for session_id, session_payload in normalized_sessions.items():
             cursor.execute(
                 """
                 INSERT INTO sessions(session_id, payload_json)
                 VALUES(?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    payload_json = excluded.payload_json
                 """,
                 (
                     str(session_id),

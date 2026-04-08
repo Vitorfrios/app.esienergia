@@ -275,32 +275,78 @@ let lastOfflineStatusMessage = "";
 let systemStatusRefreshInFlight = null;
 let lastSystemStatusPayload = null;
 let lastSystemStatusFetchedAt = 0;
+let offlineSyncAbortController = null;
+let systemStatusAbortController = null;
 const SYSTEM_STATUS_CACHE_MS = 1500;
 
-async function callOfflineSyncEndpoint(endpoint, { silent = false } = {}) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({}),
-  });
+function isShutdownInProgress() {
+  return (
+    window.__esiShutdownInProgress === true ||
+    document?.documentElement?.dataset?.shutdownInProgress === "true"
+  );
+}
 
-  const result = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const error = new Error(
-      result.error || `Falha na sincronizacao (HTTP ${response.status}).`,
-    );
-    error.isConflict = response.status === 409 || result.conflict === true;
-    error.payload = result;
-    if (!silent) {
-      throw error;
-    }
-    return { success: false, error: error.message, ...result };
+function abortAdminBackgroundRequests() {
+  if (offlineSyncAbortController) {
+    offlineSyncAbortController.abort();
+    offlineSyncAbortController = null;
   }
 
-  return result;
+  if (systemStatusAbortController) {
+    systemStatusAbortController.abort();
+    systemStatusAbortController = null;
+  }
+}
+
+window.addEventListener("esi:shutdown-start", abortAdminBackgroundRequests);
+
+async function callOfflineSyncEndpoint(endpoint, { silent = false } = {}) {
+  if (isShutdownInProgress()) {
+    return { success: false, skipped: true, message: "Shutdown em andamento." };
+  }
+
+  const controller = new AbortController();
+  offlineSyncAbortController = controller;
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+      signal: controller.signal,
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const error = new Error(
+        result.error || `Falha na sincronizacao (HTTP ${response.status}).`,
+      );
+      error.isConflict = response.status === 409 || result.conflict === true;
+      error.payload = result;
+      if (!silent) {
+        throw error;
+      }
+      return { success: false, error: error.message, ...result };
+    }
+
+    return result;
+  } catch (error) {
+    if (controller.signal.aborted || isShutdownInProgress()) {
+      return {
+        success: false,
+        skipped: true,
+        message: "Shutdown em andamento.",
+      };
+    }
+    throw error;
+  } finally {
+    if (offlineSyncAbortController === controller) {
+      offlineSyncAbortController = null;
+    }
+  }
 }
 
 function buildOfflineConflictSignature(conflicts) {
@@ -862,6 +908,10 @@ function applyBootstrapSystemStatus() {
 }
 
 async function refreshSystemStatus() {
+  if (isShutdownInProgress()) {
+    return null;
+  }
+
   const now = Date.now();
   if (systemStatusRefreshInFlight) {
     return systemStatusRefreshInFlight;
@@ -873,12 +923,14 @@ async function refreshSystemStatus() {
   }
 
   try {
+    systemStatusAbortController = new AbortController();
     systemStatusRefreshInFlight = fetch(`/api/system/storage-status?t=${Date.now()}`, {
       cache: "no-store",
       headers: {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         Pragma: "no-cache",
       },
+      signal: systemStatusAbortController.signal,
     })
       .then((response) => {
         if (!response.ok) {
@@ -897,12 +949,19 @@ async function refreshSystemStatus() {
       })
       .finally(() => {
         systemStatusRefreshInFlight = null;
+        systemStatusAbortController = null;
       });
 
     return await systemStatusRefreshInFlight;
   } catch (error) {
+    if (isShutdownInProgress()) {
+      systemStatusRefreshInFlight = null;
+      systemStatusAbortController = null;
+      return null;
+    }
     console.warn(" Falha ao atualizar status do sistema:", error);
     systemStatusRefreshInFlight = null;
+    systemStatusAbortController = null;
     return null;
   }
 }
@@ -930,6 +989,10 @@ function notifyOfflineStatusMessage(result) {
 async function reconcileOfflineAndOnline({
   endpoint = "/api/system/offline/reconcile",
 } = {}) {
+  if (isShutdownInProgress()) {
+    return { success: false, skipped: true, message: "Shutdown em andamento." };
+  }
+
   if (!isOfflineSyncAvailable()) {
     return { success: false, skipped: true };
   }
@@ -965,6 +1028,9 @@ async function reconcileOfflineAndOnline({
     );
     return result;
   } catch (error) {
+    if (isShutdownInProgress()) {
+      return { success: false, skipped: true, message: "Shutdown em andamento." };
+    }
     console.warn(" Falha na reconciliacao offline/online:", error);
     return { success: false, error: error.message };
   } finally {

@@ -6,29 +6,103 @@ import {
   clearRenderedObras,
 } from "./session-adapter.js";
 
+const SHUTDOWN_FLAG = "__esiShutdownInProgress";
+const SHUTDOWN_CLOSE_HELPER_KEY = "__esiAttemptShutdownWindowClose";
+const SHUTDOWN_BLANK_HELPER_KEY = "__esiOpenShutdownBlankPage";
+
+function markShutdownInProgress(active = true) {
+  window[SHUTDOWN_FLAG] = active;
+
+  if (document?.documentElement) {
+    document.documentElement.dataset.shutdownInProgress = active
+      ? "true"
+      : "false";
+  }
+
+  window.dispatchEvent(
+    new CustomEvent(active ? "esi:shutdown-start" : "esi:shutdown-end"),
+  );
+}
+
+function isShutdownInProgress() {
+  return window[SHUTDOWN_FLAG] === true;
+}
+
+function canAttemptDirectWindowClose() {
+  return Boolean(window.opener) || window.history.length <= 1;
+}
+
+function openBlankShutdownPage() {
+  try {
+    window.location.replace("about:blank");
+  } catch (error) {
+    console.warn(" Nao foi possivel abrir pagina em branco:", error);
+  }
+}
+
+function attemptWindowClose({ fallbackDelay = 600, allowBlankPage = true } = {}) {
+  const closeAttempts = [
+    () => window.close(),
+    () => window.open("", "_self"),
+    () => window.close(),
+    () => window.open("about:blank", "_self"),
+    () => window.close(),
+  ];
+
+  if (allowBlankPage) {
+    closeAttempts.push(() => openBlankShutdownPage());
+  }
+
+  closeAttempts.forEach((attempt, index) => {
+    setTimeout(() => {
+      if (window.closed) {
+        return;
+      }
+
+      try {
+        attempt();
+      } catch (error) {
+        console.warn(" Tentativa de fechamento bloqueada:", error);
+      }
+    }, index * 120);
+  });
+
+  if (fallbackDelay !== null) {
+    setTimeout(() => {
+      if (!window.closed) {
+        showFinalMessageWithManualClose();
+      }
+    }, Math.max(fallbackDelay, closeAttempts.length * 120 + 200));
+  }
+}
+
+window[SHUTDOWN_CLOSE_HELPER_KEY] = attemptWindowClose;
+window[SHUTDOWN_BLANK_HELPER_KEY] = openBlankShutdownPage;
+
 /**
- * Encerra o servidor e a sessão atual de forma controlada
+ * Encerra o servidor e a sessao atual de forma controlada.
  */
 async function shutdownManual() {
-  // Importa o modal de confirmação
-  const { showShutdownConfirmationModal } =
-    await import("../../ui/components/modal/exit-modal.js");
+  if (isShutdownInProgress()) {
+    return;
+  }
 
-  // Usa o modal customizado em vez do confirm nativo
+  const { showShutdownConfirmationModal } = await import(
+    "../../ui/components/modal/exit-modal.js"
+  );
+
   const confirmed = await showShutdownConfirmationModal();
-
   if (!confirmed) {
     return;
   }
 
-  console.log(" ENCERRANDO SERVIDOR E SESSÕES...");
+  console.log(" ENCERRANDO SERVIDOR E SESSOES...");
+  markShutdownInProgress(true);
 
   try {
-    // 2 MENSAGENS: Limpeza e Encerramento
-    showShutdownMessage(" Limpando sessões e encerrando servidor...");
+    showShutdownMessage(" Limpando sessoes e encerrando servidor...");
 
-    // 1. Limpa sessões no backend (continua mesmo com erro)
-    console.log(" Limpando sessões...");
+    console.log(" Limpando sessoes...");
     try {
       const sessionsResponse = await fetch("/api/sessions/shutdown", {
         method: "POST",
@@ -36,66 +110,61 @@ async function shutdownManual() {
 
       if (sessionsResponse.ok) {
         const sessionsResult = await sessionsResponse.json();
-        console.log(" Sessões limpas:", sessionsResult);
+        console.log(" Sessoes limpas:", sessionsResult);
       }
     } catch (sessionError) {
-      console.warn(" Erro ao limpar sessões, continuando:", sessionError);
+      console.warn(" Erro ao limpar sessoes, continuando:", sessionError);
     }
 
-    // 2. Limpa interface local
     setSessionActive(false);
     clearSessionObras();
     clearRenderedObras();
     window.GeralCount = 0;
 
-    // APENAS 1 SEGUNDO DE ESPERA ENTRE AS ETAPAS
     await new Promise((resolve) => setTimeout(resolve, 200));
 
-    // 3. Encerra servidor
     console.log(" Encerrando servidor...");
 
     const shutdownResponse = await fetch("/api/shutdown", {
       method: "POST",
     });
 
-    if (shutdownResponse.ok) {
-      const result = await shutdownResponse.json();
-      console.log(" Comando de shutdown enviado:", result);
-
-      // MENSAGEM FINAL ÚNICA
-      showFinalShutdownMessage();
-
-      // Fechar após delay
-      const closeDelay = result.close_delay || 2000;
-      console.log(` Fechando janela em ${closeDelay}ms...`);
-
-      setTimeout(() => {
-        console.log(" Fechando janela...");
-        window.close();
-
-        // Fallback se window.close não funcionar
-        setTimeout(() => {
-          if (!window.closed) {
-            showFinalMessageWithManualClose();
-          }
-        }, 500);
-      }, closeDelay);
-    } else {
+    if (!shutdownResponse.ok) {
       throw new Error("Falha ao encerrar servidor");
     }
+
+    const result = await shutdownResponse.json();
+    console.log(" Comando de shutdown enviado:", result);
+
+    showFinalShutdownMessage();
+
+    const closeDelay = result.close_delay || 2000;
+    console.log(` Fechando janela em ${closeDelay}ms...`);
+
+    setTimeout(() => {
+      console.log(" Fechando janela...");
+      attemptWindowClose({
+        fallbackDelay: canAttemptDirectWindowClose() ? 900 : 300,
+        allowBlankPage: true,
+      });
+    }, closeDelay);
   } catch (error) {
     console.error(" Erro no shutdown:", error);
-    showShutdownMessage(" Conexão com servidor perdida");
+    showShutdownMessage(" Conexao com servidor perdida");
     showShutdownMessage(" Status: Servidor encerrado no console");
-    showShutdownMessage(" Ação: Reexecute o servidor para continuar");
+    showShutdownMessage(" Acao: reexecute o servidor para continuar");
+
     setTimeout(() => {
-      window.close();
+      attemptWindowClose({
+        fallbackDelay: canAttemptDirectWindowClose() ? 900 : 300,
+        allowBlankPage: true,
+      });
     }, 5000);
   }
 }
 
 /**
- * Garante que apenas uma sessão esteja ativa por vez no sistema
+ * Garante que apenas uma sessao esteja ativa por vez no sistema.
  */
 async function ensureSingleActiveSession() {
   try {
@@ -104,42 +173,42 @@ async function ensureSingleActiveSession() {
     });
 
     if (!response.ok) {
-      throw new Error("Falha ao configurar sessão única");
+      throw new Error("Falha ao configurar sessao unica");
     }
 
     const result = await response.json();
-    console.log(" Sessão única configurada:", result);
+    console.log(" Sessao unica configurada:", result);
     return result;
   } catch (error) {
-    console.error(" Erro ao configurar sessão única:", error);
+    console.error(" Erro ao configurar sessao unica:", error);
     throw error;
   }
 }
 
 /**
- * Inicializa a sessão automaticamente quando o sistema carrega
+ * Inicializa a sessao automaticamente quando o sistema carrega.
  */
 async function initializeSession() {
-  console.log(" Verificando sessão...");
+  console.log(" Verificando sessao...");
 
   const { isSessionActive } = await import("./session-adapter.js");
-  const { loadObrasFromServer } =
-    await import("../adapters/obra-adapter-folder/obra-data-loader.js");
+  const { loadObrasFromServer } = await import(
+    "../adapters/obra-adapter-folder/obra-data-loader.js"
+  );
 
   if (!isSessionActive()) {
-    console.log(" Sessão não está ativa - aguardando ação do usuário");
+    console.log(" Sessao nao esta ativa - aguardando acao do usuario");
     return;
   }
 
-  console.log(" Sessão está ativa - carregando obras existentes");
+  console.log(" Sessao esta ativa - carregando obras existentes");
   await loadObrasFromServer();
 }
 
 /**
- * Mostra mensagem de encerramento elegante na tela
+ * Mostra mensagem de encerramento elegante na tela.
  */
 function showShutdownMessage(message) {
-  // Remove mensagem anterior se existir
   const existingMessage = document.getElementById("shutdown-message");
   if (existingMessage) {
     existingMessage.remove();
@@ -167,9 +236,9 @@ function showShutdownMessage(message) {
 
   messageDiv.innerHTML = `
  <div style="
- display: flex; 
- flex-direction: column; 
- align-items: center; 
+ display: flex;
+ flex-direction: column;
+ align-items: center;
  gap: 20px;
  padding: 40px;
  border-radius: 15px;
@@ -178,21 +247,20 @@ function showShutdownMessage(message) {
  border: 1px solid rgba(255, 255, 255, 0.2);
  ">
  <div style="
- font-size: 48px; 
- margin-bottom: 10px; 
+ font-size: 48px;
+ margin-bottom: 10px;
  color: #ff6b6b;
  animation: pulse 1.5s infinite;
  "></div>
  <div style="font-size: 24px; font-weight: bold;">${message}</div>
  <div style="
- font-size: 14px; 
- margin-top: 10px; 
+ font-size: 14px;
+ margin-top: 10px;
  opacity: 0.7;
- ">Aguarde enquanto o servidor é encerrado...</div>
+ ">Aguarde enquanto o servidor e encerrado...</div>
  </div>
  `;
 
-  // Adiciona estilos CSS dinamicamente
   const style = document.createElement("style");
   style.textContent = `
  @keyframes fadeIn {
@@ -211,17 +279,21 @@ function showShutdownMessage(message) {
 }
 
 /**
- * Mostra mensagem final de encerramento com confirmação
+ * Mostra mensagem final de encerramento com confirmacao.
  */
 function showFinalShutdownMessage() {
   const messageDiv = document.getElementById("shutdown-message");
   if (!messageDiv) return;
 
+  const helperText = canAttemptDirectWindowClose()
+    ? "Esta janela sera fechada automaticamente."
+    : "Tentando fechar esta guia. Se o navegador bloquear, uma tela em branco sera aberta para voce fechar manualmente.";
+
   messageDiv.innerHTML = `
  <div style="
- display: flex; 
- flex-direction: column; 
- align-items: center; 
+ display: flex;
+ flex-direction: column;
+ align-items: center;
  gap: 20px;
  padding: 40px;
  border-radius: 15px;
@@ -230,34 +302,33 @@ function showFinalShutdownMessage() {
  border: 1px solid rgba(255, 255, 255, 0.2);
  ">
  <div style="
- font-size: 64px; 
- margin-bottom: 10px; 
+ font-size: 64px;
+ margin-bottom: 10px;
  color: #4CAF50;
  animation: bounce 1s;
  "></div>
  <div style="font-size: 28px; font-weight: bold;">Servidor Encerrado</div>
  <div style="
- font-size: 16px; 
- margin-top: 5px; 
+ font-size: 16px;
+ margin-top: 5px;
  opacity: 0.7;
- ">Esta janela fechará automaticamente</div>
+ ">${helperText}</div>
  </div>
  `;
 
-  // Adiciona animação de bounce
   const style = document.createElement("style");
-  style.textContent += `
+  style.textContent = `
  @keyframes bounce {
- 0%, 20%, 50%, 80%, 100% {transform: translateY(0);}
- 40% {transform: translateY(-20px);}
- 60% {transform: translateY(-10px);}
+ 0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+ 40% { transform: translateY(-20px); }
+ 60% { transform: translateY(-10px); }
  }
  `;
   document.head.appendChild(style);
 }
 
 /**
- * Mostra mensagem final com opção de fechar manualmente a janela
+ * Mostra mensagem final com opcoes quando o navegador bloqueia o fechamento.
  */
 function showFinalMessageWithManualClose() {
   const messageDiv = document.getElementById("shutdown-message");
@@ -265,30 +336,30 @@ function showFinalMessageWithManualClose() {
 
   messageDiv.innerHTML = `
  <div style="
- display: flex; 
- flex-direction: column; 
- align-items: center; 
+ display: flex;
+ flex-direction: column;
+ align-items: center;
  gap: 20px;
  padding: 40px;
  border-radius: 15px;
  background: rgba(255, 255, 255, 0.1);
  backdrop-filter: blur(10px);
  border: 1px solid rgba(255, 255, 255, 0.2);
- max-width: 400px;
+ max-width: 420px;
  ">
  <div style="
- font-size: 48px; 
- margin-bottom: 10px; 
+ font-size: 48px;
+ margin-bottom: 10px;
  color: #4CAF50;
  "></div>
  <div style="font-size: 24px; font-weight: bold; text-align: center;">Servidor Encerrado</div>
  <div style="
- font-size: 14px; 
- margin-top: 10px; 
+ font-size: 14px;
+ margin-top: 10px;
  opacity: 0.7;
  text-align: center;
- ">O servidor foi encerrado com sucesso</div>
- <button onclick="window.close()" style="
+ ">O servidor foi encerrado com sucesso. O navegador pode bloquear o fechamento automatico de abas abertas externamente.</div>
+ <button onclick="window.__esiAttemptShutdownWindowClose && window.__esiAttemptShutdownWindowClose({ fallbackDelay: null, allowBlankPage: true })" style="
  margin-top: 20px;
  padding: 10px 20px;
  background: #4CAF50;
@@ -297,12 +368,21 @@ function showFinalMessageWithManualClose() {
  border-radius: 5px;
  cursor: pointer;
  font-size: 14px;
- ">Fechar Janela</button>
+ ">Tentar Fechar</button>
+ <button onclick="window.__esiOpenShutdownBlankPage && window.__esiOpenShutdownBlankPage()" style="
+ margin-top: 10px;
+ padding: 10px 20px;
+ background: transparent;
+ color: white;
+ border: 1px solid rgba(255, 255, 255, 0.35);
+ border-radius: 5px;
+ cursor: pointer;
+ font-size: 14px;
+ ">Abrir Tela em Branco</button>
  </div>
  `;
 }
 
-// Disponibilizar globalmente
 window.shutdownManual = shutdownManual;
 
 export { shutdownManual, ensureSingleActiveSession, initializeSession };

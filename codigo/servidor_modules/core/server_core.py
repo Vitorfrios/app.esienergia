@@ -149,6 +149,68 @@ class ServerCore:
             print(f" URL: http://localhost:{port}/admin/obras/create")
         print("=" * 50)
 
+    def _find_app_browser_executable(self):
+        """Tenta localizar um navegador Chromium para abrir em modo app."""
+        candidates = []
+
+        env_paths = [
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+
+        browser_relative_paths = [
+            ("Microsoft", "Edge", "Application", "msedge.exe"),
+            ("Google", "Chrome", "Application", "chrome.exe"),
+            ("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        ]
+
+        for base_dir in env_paths:
+            if not base_dir:
+                continue
+            for relative_path in browser_relative_paths:
+                candidate = Path(base_dir).joinpath(*relative_path)
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        return None
+
+    def _open_browser_app_window(self, url):
+        """Abre a aplicacao em janela dedicada, mais amigavel para fechamento automatico."""
+        if sys.platform != "win32":
+            return False
+
+        browser_executable = self._find_app_browser_executable()
+        if not browser_executable:
+            return False
+
+        temp_profile_dir = Path(tempfile.gettempdir()) / "esi-browser-profile"
+        temp_profile_dir.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            browser_executable,
+            f"--app={url}",
+            "--new-window",
+            f"--user-data-dir={temp_profile_dir}",
+        ]
+
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            print(" Janela da aplicacao aberta em modo app")
+            return True
+        except Exception as exc:
+            print(f" Aviso ao abrir navegador em modo app: {exc}")
+            return False
+
     def open_browser(self, port=8000):
         """Abre o navegador automaticamente"""
         if self.is_production:
@@ -158,8 +220,12 @@ class ServerCore:
         url = f"http://localhost:{port}/admin/obras/create"
         
         try:
+            if self._open_browser_app_window(url):
+                return
+
             import webbrowser
             webbrowser.open(url)
+            print(" Navegador iniciado em modo padrao")
         except Exception as e:
             print(f"Acesse manualmente: {url}")
 
