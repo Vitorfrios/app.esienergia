@@ -164,7 +164,7 @@
                 <img src="https://esienergia.com.br/wp-content/uploads/2024/02/favicon5.png" alt="Logo ESI Energia"
                     class="login-logo">
                 <h1 class="login-title">Acesso ao Sistema</h1>
-                <p class="login-subtitle">Entre com usuário e o token de acesso</p>
+                <p class="login-subtitle">Entre com usuario e a senha de acesso</p>
             </div>
 
             <form class="login-form" id="loginForm" autocomplete="off">
@@ -180,11 +180,11 @@
                 <div class="input-group">
                     <label for="password" class="input-label">
                         <i class="fas fa-lock"></i>
-                        Token
+                        Senha
                     </label>
                     <div class="password-field-wrapper">
                         <input type="password" id="password" name="password" class="input-field"
-                            placeholder="Digite sua senha ou token" autocomplete="off" required>
+                            placeholder="Digite sua senha" autocomplete="off" required>
                         <button type="button" class="password-toggle" id="togglePassword">
                             <i class="fas fa-eye"></i>
                         </button>
@@ -193,7 +193,7 @@
 
                 <div class="login-options">
                     <button type="button" class="forgot-password" id="openRecoveryModalBtn">
-                        Esqueci o token
+                        Esqueci a senha
                     </button>
                 </div>
 
@@ -227,14 +227,14 @@
                 <div class="modal-icon">
                     <i class="fas fa-envelope-open-text"></i>
                 </div>
-                <h3 class="modal-title">Recuperar Token</h3>
+                <h3 class="modal-title">Recuperar Senha</h3>
                 <button type="button" class="modal-close" id="closeRecoveryModalBtn" aria-label="Fechar">
                     <i class="fas fa-times"></i>
                 </button>
             </div>
 
             <p class="modal-description">
-                Informe o tipo de acesso, o usuário e o email cadastrado para receber o token atual.
+                Informe o tipo de acesso, o usuario e o email cadastrado para receber a senha atual.
             </p>
 
             <form class="recover-form" id="recoverTokenForm" autocomplete="off">
@@ -262,7 +262,7 @@
                 <div class="modal-actions">
                     <button type="button" class="modal-btn btn-cancel" id="cancelRecoveryBtn">Cancelar</button>
                     <button type="submit" class="modal-btn btn-send" id="sendRecoveryBtn">
-                        <span class="btn-text">Enviar token</span>
+                        <span class="btn-text">Enviar senha</span>
                         <i class="fas fa-paper-plane"></i>
                     </button>
                 </div>
@@ -270,12 +270,40 @@
 
             <div class="recover-footer">
                 <i class="fas fa-shield-alt"></i>
-                <span>Para recuperar o token de acesso o email precisa estar cadastrado</span>
+                <span>Para recuperar a senha de acesso o email precisa estar cadastrado</span>
             </div>
         </div>
     </div>
 
     <script defer src="/public/dist/client-login.min.js?v=20260323-2"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const replaceVisibleTokenText = function () {
+                const sendButtonText = document.querySelector('#sendRecoveryBtn .btn-text');
+                if (sendButtonText && /token/i.test(sendButtonText.textContent || '')) {
+                    sendButtonText.textContent = 'Enviar senha';
+                }
+
+                ['loginFeedback', 'recoverTokenFeedback'].forEach(function (id) {
+                    const element = document.getElementById(id);
+                    if (!element || !element.textContent) {
+                        return;
+                    }
+
+                    element.textContent = element.textContent
+                        .replace(/Token/g, 'Senha')
+                        .replace(/token/g, 'senha');
+                });
+            };
+
+            replaceVisibleTokenText();
+            new MutationObserver(replaceVisibleTokenText).observe(document.body, {
+                childList: true,
+                subtree: true,
+                characterData: true
+            });
+        });
+    </script>
 </body>
 
 </html>

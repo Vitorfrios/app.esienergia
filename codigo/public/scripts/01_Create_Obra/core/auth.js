@@ -115,7 +115,7 @@ async function loginClient({ usuario, token }) {
         return {
             success: false,
             reason: 'missing_credentials',
-            message: 'Usuário e token são obrigatórios.'
+            message: 'Usuario e senha sao obrigatorios.'
         };
     }
 

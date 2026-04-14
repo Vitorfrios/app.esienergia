@@ -1,0 +1,108 @@
+.admin-email-config-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1.25rem;
+    border: 1px solid var(--color-gray-200, #e2e8f0);
+    border-radius: 1rem;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 245, 249, 0.92));
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+}
+
+.admin-email-config-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+}
+
+.admin-email-config-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.45rem 0.8rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.admin-email-config-badge.tone-success {
+    background: rgba(45, 119, 78, 0.12);
+    color: #2d774e;
+    border: 1px solid rgba(45, 119, 78, 0.24);
+}
+
+.admin-email-config-badge.tone-warning {
+    background: rgba(180, 83, 9, 0.12);
+    color: #b45309;
+    border: 1px solid rgba(180, 83, 9, 0.24);
+}
+
+.admin-email-config-badge.tone-muted {
+    background: rgba(100, 116, 139, 0.12);
+    color: #475569;
+    border: 1px solid rgba(100, 116, 139, 0.2);
+}
+
+.admin-email-config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+}
+
+.admin-email-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+}
+
+.admin-email-field span {
+    color: var(--color-gray-700, #334155);
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.admin-email-field input {
+    width: 100%;
+    padding: 0.8rem 0.95rem;
+    border: 1px solid var(--color-gray-300, #cbd5e1);
+    border-radius: 0.75rem;
+    background: var(--color-white, #fff);
+    color: var(--color-gray-800, #1e293b);
+    font-size: 0.92rem;
+}
+
+.admin-email-field input:focus {
+    outline: none;
+    border-color: var(--color-primary, #4a5568);
+    box-shadow: 0 0 0 3px rgba(74, 85, 104, 0.1);
+}
+
+.admin-email-field-token {
+    grid-column: 1 / -1;
+}
+
+.admin-email-config-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+}
+
+.admin-email-config-status {
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: var(--color-gray-600, #475569);
+}
+
+@media (max-width: 720px) {
+    .admin-email-config-header {
+        flex-direction: column;
+    }
+
+    .admin-email-config-badge {
+        white-space: normal;
+    }
+}

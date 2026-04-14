@@ -69,7 +69,7 @@ function toggleRecoveryLoading(isLoading) {
 
     const buttonText = sendButton.querySelector('.btn-text');
     if (buttonText) {
-        buttonText.textContent = isLoading ? 'Enviando...' : 'Enviar token';
+        buttonText.textContent = isLoading ? 'Enviando...' : 'Enviar senha';
     }
 }
 
@@ -135,16 +135,16 @@ function bindRecoveryModal() {
 
             const result = await response.json().catch(() => ({}));
             if (!response.ok || !result.success) {
-                throw new Error(result.error || 'Não foi possível enviar o token.');
+                throw new Error(result.error || 'Nao foi possivel enviar a senha.');
             }
 
-            setRecoveryFeedback(result.message || 'Token enviado para o email cadastrado.', 'success');
+            setRecoveryFeedback(result.message || 'Senha enviada para o email cadastrado.', 'success');
             window.setTimeout(() => {
                 closeRecoveryModal();
             }, 1200);
         } catch (error) {
             console.error('[CLIENT-LOGIN] Erro na recuperação:', error);
-            setRecoveryFeedback(error.message || 'Não foi possível recuperar o token.', 'error');
+            setRecoveryFeedback(error.message || 'Nao foi possivel recuperar a senha.', 'error');
         } finally {
             toggleRecoveryLoading(false);
         }

@@ -5,12 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
-import smtplib
 import shutil
 import tempfile
 import time
 import zipfile
-from email.message import EmailMessage
 from email.utils import formataddr
 from html import escape as html_escape
 from pathlib import Path
@@ -20,85 +18,9 @@ from urllib import request as urllib_request
 from servidor_modules.handlers.word_handler import WordHandler
 from servidor_modules.utils.admin_email_config import (
     AdminEmailConfigStore,
+    get_resend_api_key,
     is_valid_email,
 )
-
-
-def normalize_smtp_secret(sender_email, token):
-    """Normaliza segredos SMTP para provedores com formatos conhecidos."""
-    normalized_email = str(sender_email or "").strip().lower()
-    normalized_token = str(token or "").strip()
-
-    if not normalized_token:
-        return ""
-
-    domain = normalized_email.split("@", 1)[1] if "@" in normalized_email else ""
-    if domain in {"gmail.com", "googlemail.com"}:
-        return "".join(normalized_token.split())
-
-    return normalized_token
-
-
-def validate_smtp_secret(sender_email, token):
-    """Valida segredos SMTP para provedores com regras conhecidas."""
-    normalized_email = str(sender_email or "").strip().lower()
-    normalized_token = normalize_smtp_secret(sender_email, token)
-    domain = normalized_email.split("@", 1)[1] if "@" in normalized_email else ""
-
-    if domain in {"gmail.com", "googlemail.com"} and len(normalized_token) != 16:
-        raise RuntimeError(
-            "Para Gmail, informe a senha de app de 16 caracteres do Google, não o token do ADM do sistema."
-        )
-
-    return normalized_token
-
-
-def build_smtp_connection_candidates(host, port, use_tls, sender_email):
-    """Monta candidatos de conexão SMTP, com fallback para Gmail."""
-    resolved_host = str(host or "").strip()
-    resolved_port = int(port or 587)
-    resolved_use_tls = bool(use_tls)
-    normalized_email = str(sender_email or "").strip().lower()
-    domain = normalized_email.split("@", 1)[1] if "@" in normalized_email else ""
-
-    candidates = [
-        {
-            "host": resolved_host,
-            "port": resolved_port,
-            "use_tls": resolved_use_tls,
-            "use_ssl": (not resolved_use_tls and resolved_port == 465),
-            "label": "primary",
-        }
-    ]
-
-    if domain in {"gmail.com", "googlemail.com"} and resolved_host == "smtp.gmail.com":
-        fallback = {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "use_tls": False,
-            "use_ssl": True,
-            "label": "gmail_ssl_fallback",
-        }
-        already_present = any(
-            candidate["host"] == fallback["host"]
-            and candidate["port"] == fallback["port"]
-            and candidate["use_ssl"] == fallback["use_ssl"]
-            for candidate in candidates
-        )
-        if not already_present:
-            candidates.append(fallback)
-
-    return candidates
-
-
-def get_resend_api_key():
-    """Obtém a API key do Resend a partir do ambiente."""
-    return str(
-        os.environ.get("resend_API")
-        or os.environ.get("RESEND_API")
-        or os.environ.get("RESEND_API_KEY")
-        or ""
-    ).strip()
 
 
 def build_resend_sender(sender_email, sender_name):
@@ -106,6 +28,7 @@ def build_resend_sender(sender_email, sender_name):
     resolved_email = str(
         os.environ.get("RESEND_FROM_EMAIL")
         or os.environ.get("RESEND_FROM")
+        or sender_email
         or "onboarding@resend.dev"
     ).strip()
     resolved_name = str(
@@ -408,158 +331,35 @@ def prepare_email_attachments(attachment_files):
 
 
 def enviar_email(destino, assunto, mensagem, attachment_files=None):
-    """Envia um email usando a configuração SMTP do ADM."""
+    """Envia um email usando a configuração do ADM via Resend."""
     config_store = AdminEmailConfigStore()
     config = config_store.load()
 
     if not config_store.is_configured(config):
-        raise RuntimeError("Configuração SMTP do ADM não encontrada")
+        raise RuntimeError(
+            "Configuração de email do ADM não encontrada ou RESEND_API ausente."
+        )
 
     destination = str(destino or "").strip()
     if not is_valid_email(destination):
         raise ValueError("Endereço de email de destino inválido")
 
     attachments = normalize_attachment_files(attachment_files)
-
-    resend_error = None
     sender_email = str(config.get("email") or "").strip()
     sender_name = str(config.get("nome") or "").strip() or sender_email
 
-    if get_resend_api_key():
-        try:
-            send_via_resend(
-                destino=destination,
-                assunto=str(assunto or "").strip() or "Exportação de obra",
-                mensagem=mensagem,
-                sender_email=sender_email,
-                sender_name=sender_name,
-                attachments=attachments,
-            )
-            return
-        except Exception as exc:
-            resend_error = exc
-            print(" Aviso Resend:", exc)
-
-    smtp_settings = config_store.resolve_smtp_settings(config)
-    host = str(smtp_settings.get("host") or "").strip()
-    port = int(smtp_settings.get("port") or 587)
-    use_tls = bool(smtp_settings.get("use_tls", True))
-
-    if not host:
-        if resend_error is not None:
-            raise RuntimeError(
-                "Falha no envio via Resend e nenhum servidor SMTP foi configurado."
-            ) from resend_error
-        raise RuntimeError("Não foi possível resolver o servidor SMTP")
-
-    sender_email = str(config.get("email") or "").strip()
-    sender_name = str(config.get("nome") or "").strip() or sender_email
-
-    message = EmailMessage()
-    message["Subject"] = str(assunto or "").strip() or "Exportação de obra"
-    message["From"] = formataddr((sender_name, sender_email))
-    message["To"] = destination
-    message.set_content(str(mensagem or "").strip() or "Segue arquivo em anexo.")
-
-    for attachment in attachments:
-        file_path = Path(str(attachment.get("path") or ""))
-        filename = str(attachment.get("filename") or file_path.name).strip() or file_path.name
-        suffix = file_path.suffix.lower()
-        subtype = "octet-stream"
-        file_bytes = read_verified_attachment_bytes(file_path)
-
-        if suffix == ".docx":
-            subtype = "vnd.openxmlformats-officedocument.wordprocessingml.document"
-        elif suffix == ".zip":
-            subtype = "zip"
-
-        message.add_attachment(
-            file_bytes,
-            maintype="application",
-            subtype=subtype,
-            filename=filename,
-            cte="base64",
-        )
-
-    smtp_token = validate_smtp_secret(sender_email, config.get("token") or "")
-    smtp_candidates = build_smtp_connection_candidates(host, port, use_tls, sender_email)
-    last_error = None
-
-    for smtp_candidate in smtp_candidates:
-        smtp_client = None
-        try:
-            if smtp_candidate["use_ssl"]:
-                smtp_client = smtplib.SMTP_SSL(
-                    smtp_candidate["host"],
-                    smtp_candidate["port"],
-                    timeout=30,
-                )
-            else:
-                smtp_client = smtplib.SMTP(
-                    smtp_candidate["host"],
-                    smtp_candidate["port"],
-                    timeout=30,
-                )
-                smtp_client.ehlo()
-                if smtp_candidate["use_tls"]:
-                    smtp_client.starttls()
-                    smtp_client.ehlo()
-
-            smtp_client.login(sender_email, smtp_token)
-            smtp_client.send_message(message)
-            return
-        except smtplib.SMTPAuthenticationError as exc:
-            last_error = exc
-        except Exception as exc:
-            last_error = exc
-            print(
-                " Aviso SMTP:",
-                smtp_candidate["label"],
-                smtp_candidate["host"],
-                smtp_candidate["port"],
-                exc,
-            )
-        finally:
-            if smtp_client is not None:
-                try:
-                    smtp_client.quit()
-                except Exception:
-                    pass
-
-    if False and get_resend_api_key():
-        try:
-            send_via_resend(
-                destino=destination,
-                assunto=message["Subject"],
-                mensagem=mensagem,
-                sender_email=sender_email,
-                sender_name=sender_name,
-                attachments=attachments,
-            )
-            return
-        except Exception as exc:
-            resend_error = exc
-            print(" Aviso Resend fallback:", exc)
-
-    if isinstance(last_error, smtplib.SMTPAuthenticationError):
-        domain = sender_email.split("@", 1)[1].lower() if "@" in sender_email else ""
-        if domain in {"gmail.com", "googlemail.com"}:
-            raise RuntimeError(
-                "Gmail rejeitou a autenticação SMTP. Verifique se o App Password está correto e se a conta usa verificação em duas etapas."
-            ) from last_error
-        raise RuntimeError("Credenciais SMTP rejeitadas pelo provedor de email.") from last_error
-
-    if resend_error is not None:
-        raise RuntimeError(
-            f"Falha no envio por SMTP ({host}:{port}) e tambem no fallback Resend."
-        ) from resend_error
-
-    if last_error is not None:
-        raise RuntimeError(f"Falha ao conectar ao servidor SMTP ({host}:{port}).") from last_error
+    send_via_resend(
+        destino=destination,
+        assunto=str(assunto or "").strip() or "Exportação de obra",
+        mensagem=mensagem,
+        sender_email=sender_email,
+        sender_name=sender_name,
+        attachments=attachments,
+    )
 
 
 def enviar_email_com_anexos(destino, assunto, mensagem, attachment_files):
-    """Envia um email com anexos diretos usando a configuração SMTP do ADM."""
+    """Envia um email com anexos diretos usando a configuração do ADM via Resend."""
     attachments, temp_paths = prepare_email_attachments(attachment_files)
     if not attachments:
         raise FileNotFoundError("Nenhum arquivo válido encontrado para envio")

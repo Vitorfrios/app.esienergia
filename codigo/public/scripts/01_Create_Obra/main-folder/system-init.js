@@ -337,9 +337,6 @@ async function loadAllModules() {
 async function initializeEmpresaCadastro() {
   try {
     console.log(" Inicializando sistema de cadastro de empresas...");
-
-    await new Promise((resolve) => setTimeout(resolve, 62));
-
     window.empresaCadastro = new EmpresaCadastroInline();
 
     console.log(" Sistema de cadastro de empresas inicializado");

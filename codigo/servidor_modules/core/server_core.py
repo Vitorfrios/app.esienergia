@@ -211,6 +211,14 @@ class ServerCore:
             print(f" Aviso ao abrir navegador em modo app: {exc}")
             return False
 
+    def _should_use_app_browser_window(self):
+        return str(os.environ.get("ESI_BROWSER_APP_MODE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def open_browser(self, port=8000):
         """Abre o navegador automaticamente"""
         if self.is_production:
@@ -220,7 +228,7 @@ class ServerCore:
         url = f"http://localhost:{port}/admin/obras/create"
         
         try:
-            if self._open_browser_app_window(url):
+            if self._should_use_app_browser_window() and self._open_browser_app_window(url):
                 return
 
             import webbrowser

@@ -1,4 +1,4 @@
-"""Persistencia e resolucao da configuracao de email administrativa via PostgreSQL."""
+"""Persistencia e resolucao da configuracao administrativa de email via Resend."""
 
 from __future__ import annotations
 
@@ -15,26 +15,33 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 DEFAULT_EMAIL_CONFIG = {
     "email": "",
-    "token": "",
     "nome": "",
-    "smtpHost": "",
-    "smtpPort": None,
-    "useTls": True,
     "updatedAt": None,
 }
 
-COMMON_SMTP_PROVIDERS = {
-    "gmail.com": {"host": "smtp.gmail.com", "port": 587, "use_tls": True},
-    "googlemail.com": {"host": "smtp.gmail.com", "port": 587, "use_tls": True},
-    "outlook.com": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
-    "hotmail.com": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
-    "live.com": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
-    "msn.com": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
-    "office365.com": {"host": "smtp.office365.com", "port": 587, "use_tls": True},
-    "yahoo.com": {"host": "smtp.mail.yahoo.com", "port": 587, "use_tls": True},
-    "icloud.com": {"host": "smtp.mail.me.com", "port": 587, "use_tls": True},
-    "me.com": {"host": "smtp.mail.me.com", "port": 587, "use_tls": True},
-}
+
+def get_resend_api_key():
+    """Obtem a API key do Resend a partir do ambiente."""
+    return str(
+        os.environ.get("resend_API")
+        or os.environ.get("RESEND_API")
+        or os.environ.get("RESEND_API_KEY")
+        or ""
+    ).strip()
+
+
+def get_resend_from_email():
+    """Obtem o remetente padrao do Resend a partir do ambiente."""
+    return str(
+        os.environ.get("RESEND_FROM_EMAIL")
+        or os.environ.get("RESEND_FROM")
+        or ""
+    ).strip()
+
+
+def get_resend_from_name():
+    """Obtem o nome padrao do remetente a partir do ambiente."""
+    return str(os.environ.get("RESEND_FROM_NAME") or "").strip()
 
 
 def is_valid_email(value):
@@ -43,7 +50,7 @@ def is_valid_email(value):
 
 
 class AdminEmailConfigStore:
-    """Le e grava a configuracao SMTP do administrador no PostgreSQL."""
+    """Le e grava a configuracao administrativa de envio por email."""
 
     def __init__(self, project_root=None):
         self.project_root = (
@@ -55,6 +62,19 @@ class AdminEmailConfigStore:
         self.conn = get_connection(self.project_root)
         self.config_key = "default"
 
+    @staticmethod
+    def _row_value(row, key, default=""):
+        if row is None:
+            return default
+        try:
+            if isinstance(row, dict):
+                return row.get(key, default)
+            if hasattr(row, "keys") and key in row.keys():
+                return row[key]
+        except Exception:
+            return default
+        return default
+
     def _normalize_payload(self, payload):
         payload = payload if isinstance(payload, dict) else {}
         normalized = deepcopy(DEFAULT_EMAIL_CONFIG)
@@ -65,31 +85,25 @@ class AdminEmailConfigStore:
             or payload.get("usuario")
             or ""
         ).strip()
-        normalized["token"] = str(
-            payload.get("token") or payload.get("adminToken") or ""
-        ).strip()
         normalized["nome"] = str(
             payload.get("nome") or payload.get("adminNome") or ""
         ).strip()
-        normalized["smtpHost"] = str(payload.get("smtpHost") or "").strip()
+        normalized["updatedAt"] = payload.get("updatedAt") or payload.get("updated_at")
+        return normalized
 
-        smtp_port = payload.get("smtpPort")
-        try:
-            normalized["smtpPort"] = int(smtp_port) if smtp_port is not None else None
-        except (TypeError, ValueError):
-            normalized["smtpPort"] = None
-
-        if "useTls" in payload:
-            normalized["useTls"] = bool(payload.get("useTls"))
-
-        normalized["updatedAt"] = payload.get("updatedAt")
+    def _apply_env_fallback(self, config):
+        normalized = self._normalize_payload(config)
+        if not normalized["email"]:
+            normalized["email"] = get_resend_from_email()
+        if not normalized["nome"]:
+            normalized["nome"] = get_resend_from_name() or "ESI Energia"
         return normalized
 
     def load(self):
         try:
             row = self.conn.execute(
                 """
-                SELECT email, token, nome, smtp_host, smtp_port, use_tls, updated_at
+                SELECT *
                 FROM admin_email_config
                 WHERE config_key = ?
                 """,
@@ -97,15 +111,11 @@ class AdminEmailConfigStore:
             ).fetchone()
 
             if row is not None:
-                return self._normalize_payload(
+                return self._apply_env_fallback(
                     {
-                        "email": row["email"],
-                        "token": row["token"],
-                        "nome": row["nome"],
-                        "smtpHost": row["smtp_host"],
-                        "smtpPort": row["smtp_port"],
-                        "useTls": bool(row["use_tls"]),
-                        "updatedAt": row["updated_at"],
+                        "email": self._row_value(row, "email", ""),
+                        "nome": self._row_value(row, "nome", ""),
+                        "updatedAt": self._row_value(row, "updated_at"),
                     }
                 )
         except Exception:
@@ -113,9 +123,9 @@ class AdminEmailConfigStore:
 
         migrated_config = self._migrate_legacy_json_if_available()
         if migrated_config is not None:
-            return migrated_config
+            return self._apply_env_fallback(migrated_config)
 
-        return deepcopy(DEFAULT_EMAIL_CONFIG)
+        return self._apply_env_fallback(DEFAULT_EMAIL_CONFIG)
 
     def save(self, payload):
         normalized = self._normalize_payload(payload)
@@ -124,37 +134,24 @@ class AdminEmailConfigStore:
             INSERT INTO admin_email_config(
                 config_key,
                 email,
-                token,
                 nome,
-                smtp_host,
-                smtp_port,
-                use_tls,
                 updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(config_key) DO UPDATE SET
                 email = excluded.email,
-                token = excluded.token,
                 nome = excluded.nome,
-                smtp_host = excluded.smtp_host,
-                smtp_port = excluded.smtp_port,
-                use_tls = excluded.use_tls,
                 updated_at = excluded.updated_at
             """,
             (
                 self.config_key,
                 normalized["email"],
-                normalized["token"],
                 normalized["nome"],
-                normalized["smtpHost"],
-                normalized["smtpPort"],
-                1 if normalized["useTls"] else 0,
                 normalized["updatedAt"],
             ),
         )
         self.conn.commit()
         self._remove_legacy_json_file()
-
         return normalized
 
     def _migrate_legacy_json_if_available(self):
@@ -179,47 +176,14 @@ class AdminEmailConfigStore:
             pass
 
     def is_configured(self, config=None):
-        loaded_config = config or self.load()
-        return bool(
-            loaded_config.get("email")
-            and loaded_config.get("token")
-            and is_valid_email(loaded_config.get("email"))
-        )
+        loaded_config = self._apply_env_fallback(config or self.load())
+        email = str(loaded_config.get("email") or "").strip()
+        return bool(email and is_valid_email(email) and get_resend_api_key())
 
-    def resolve_smtp_settings(self, config=None):
-        loaded_config = config or self.load()
-        email = str(loaded_config.get("email") or "").strip().lower()
-        domain = email.split("@", 1)[1] if "@" in email else ""
-
-        env_host = str(os.environ.get("ESI_SMTP_HOST", "") or "").strip()
-        env_port = str(os.environ.get("ESI_SMTP_PORT", "") or "").strip()
-        env_use_tls = str(os.environ.get("ESI_SMTP_USE_TLS", "") or "").strip()
-
-        if env_host:
-            host = env_host
-            try:
-                port = int(env_port) if env_port else 587
-            except ValueError:
-                port = 587
-            use_tls = env_use_tls.lower() not in {"0", "false", "no", "off"}
-            return {"host": host, "port": port, "use_tls": use_tls}
-
-        if loaded_config.get("smtpHost"):
-            return {
-                "host": loaded_config["smtpHost"],
-                "port": int(loaded_config.get("smtpPort") or 587),
-                "use_tls": bool(loaded_config.get("useTls", True)),
-            }
-
-        provider = COMMON_SMTP_PROVIDERS.get(domain)
-        if provider:
-            return dict(provider)
-
-        if domain:
-            return {
-                "host": f"smtp.{domain}",
-                "port": int(loaded_config.get("smtpPort") or 587),
-                "use_tls": bool(loaded_config.get("useTls", True)),
-            }
-
-        return {"host": "", "port": 587, "use_tls": True}
+    def resolve_delivery_mode(self, config=None):
+        loaded_config = self._apply_env_fallback(config or self.load())
+        if not is_valid_email(loaded_config.get("email")):
+            return "unconfigured"
+        if get_resend_api_key():
+            return "resend"
+        return "unconfigured"

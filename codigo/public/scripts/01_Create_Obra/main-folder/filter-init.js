@@ -506,13 +506,13 @@ function setupDynamicButtonConfiguration() {
  */
 function waitForSystemLoad() {
   return new Promise((resolve) => {
-    if (document.readyState === "complete") {
+    if (document.readyState !== "loading" || window.systemLoaded) {
       resolve();
       return;
     }
 
     const checkInterval = setInterval(() => {
-      if (window.systemLoaded || document.readyState === "complete") {
+      if (window.systemLoaded || document.readyState !== "loading") {
         clearInterval(checkInterval);
         resolve();
       }
@@ -522,7 +522,7 @@ function waitForSystemLoad() {
     setTimeout(() => {
       clearInterval(checkInterval);
       resolve();
-    }, 500);
+    }, 250);
   });
 }
 

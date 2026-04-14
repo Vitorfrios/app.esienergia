@@ -329,7 +329,7 @@ class EmpresaHandler:
             return {
                 "success": False,
                 "reason": "missing_credentials",
-                "message": "Usuario e token sao obrigatorios.",
+                "message": "Usuario e senha sao obrigatorios.",
             }
 
         try:
@@ -346,7 +346,7 @@ class EmpresaHandler:
             return {
                 "success": False,
                 "reason": "user_not_found",
-                "message": "Usuario nao encontrado ou token expirado.",
+                "message": "Usuario nao encontrado ou senha expirada.",
             }
 
         credenciais = login_record.get("credenciais")
@@ -362,14 +362,14 @@ class EmpresaHandler:
             return {
                 "success": False,
                 "reason": "invalid_token",
-                "message": "Token invalido.",
+                "message": "Senha invalida.",
             }
 
         if self.credenciais_expiradas(credenciais):
             return {
                 "success": False,
                 "reason": "expired",
-                "message": "Token expirado. Solicite um novo acesso.",
+                "message": "Senha expirada. Solicite um novo acesso.",
             }
 
         expiration_date = self.calcular_data_expiracao_credenciais(credenciais)

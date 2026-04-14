@@ -590,7 +590,7 @@ function showCredentialsModal(index) {
                     Email de recuperação:
                 </label>
                 <input type="email" id="emailInput" value="${escapeHtml(emailAtual)}" 
-                       placeholder="Email usado para recuperar o token"
+                       placeholder="Email usado para recuperar a senha"
                        style="width: 100%; padding: 8px; border: 1px solid #2d3748; border-radius: 6px; font-size: 1rem; transition: all 0.2s ease; background: #2d3748; color: #f7fafc;"
                        onfocus="this.style.borderColor='#4a5568'; this.style.boxShadow='0 0 0 3px rgba(74, 85, 104, 0.3)'; this.style.outline='none'"
                        onblur="this.style.borderColor='#2d3748'; this.style.boxShadow='none'">

@@ -124,11 +124,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS admin_email_config (
     config_key TEXT PRIMARY KEY,
     email TEXT NOT NULL DEFAULT '',
-    token TEXT NOT NULL DEFAULT '',
     nome TEXT NOT NULL DEFAULT '',
-    smtp_host TEXT NOT NULL DEFAULT '',
-    smtp_port INTEGER,
-    use_tls INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT
 );
 

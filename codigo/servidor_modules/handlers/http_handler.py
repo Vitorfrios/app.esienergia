@@ -110,6 +110,20 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         "valor",
         "value",
     }
+    ADMIN_CREATE_ROUTE = "/admin/obras/create"
+    ADMIN_CREATE_SESSION_SCOPE = "admin_create_only"
+    ADMIN_CREATE_LINK_QUERY_PARAM = "access"
+    ADMIN_DIRECT_ROUTE_PREFIX = "/admin/"
+    ADMIN_CREATE_ALLOWED_REQUEST_PATHS = {
+        ADMIN_CREATE_ROUTE,
+        "/obras",
+        "/constants",
+        "/system-constants",
+        "/dados",
+        "/backup",
+        "/machines",
+        "/session-obras",
+    }
     PAGE_ACCESS_ROLES = {
         "/login": None,
         "/obras/create": {"client", "admin"},
@@ -390,6 +404,11 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     }
 
     LEGACY_PAGE_REDIRECTS = {
+        "/adm": "/admin/data",
+        "/adm/": "/admin/data",
+        "/adm/data": "/admin/data",
+        "/adm/obras/create": "/admin/obras/create",
+        "/adm/obras/embed": "/admin/obras/embed",
         "/public/pages/00_Client_Login.html": "/login",
         "/public/pages/01_Create_Obras_Client.html": "/obras/create",
         "/public/pages/01_Create_Obras.html": "/admin/obras/create",
@@ -483,6 +502,41 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def _normalize_text(self, value):
         return str(value or "").strip().upper()
 
+    def _get_request_bridge_route(self):
+        route_path = str(self.headers.get(self.BRIDGE_ROUTE_HEADER) or "").strip()
+        if route_path.endswith("/") and len(route_path) > 1:
+            return route_path[:-1]
+        return route_path
+
+    def _is_admin_create_only_session(self, session=None):
+        session = session or self.get_auth_session() or {}
+        return (
+            session.get("role") == "admin"
+            and session.get("scope") == self.ADMIN_CREATE_SESSION_SCOPE
+        )
+
+    def _can_use_admin_create_only_session(self, path, session=None):
+        session = session or self.get_auth_session() or {}
+        if not self._is_admin_create_only_session(session):
+            return False
+
+        normalized_path = str(path or "").strip()
+        if normalized_path == self.ADMIN_CREATE_ROUTE:
+            return True
+
+        if normalized_path in self.PUBLIC_API_ROUTES:
+            return True
+
+        if self._get_request_bridge_route() != self.ADMIN_CREATE_ROUTE:
+            return False
+
+        if normalized_path in self.ADMIN_CREATE_ALLOWED_REQUEST_PATHS:
+            return True
+
+        return normalized_path.startswith("/api/") or normalized_path.startswith(
+            "/obras/"
+        )
+
     def _resolve_company_email_from_session(self, session=None):
         session = session or self.get_auth_session() or {}
         if session.get("role") != "client":
@@ -549,9 +603,9 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         client_ip = str(self.client_address[0] or "").strip()
         return client_ip in {"127.0.0.1", "::1", "localhost"}
 
-    def _issue_local_admin_session(self):
-        admin_user = "local_admin"
-        admin_name = "Administrador Local"
+    def _resolve_scoped_admin_identity(self):
+        admin_user = "obra_admin"
+        admin_name = "Acesso Obras"
         admin_level = "ADM"
 
         try:
@@ -567,6 +621,66 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self._touch_admin_last_access(admin_user)
         except Exception:
             pass
+
+        return admin_user, admin_name, admin_level
+
+    def _issue_remote_admin_session(self, source="admin_direct_entry"):
+        admin_user, admin_name, admin_level = self._resolve_scoped_admin_identity()
+        admin_session_token, payload = self.session_security.create_signed_token(
+            {
+                "role": "admin",
+                "usuario": admin_user,
+                "nome": admin_name,
+                "nivel": admin_level,
+                "source": source,
+            }
+        )
+        self.queue_response_header(
+            "Set-Cookie",
+            self.session_security.build_set_cookie_header(admin_session_token),
+        )
+        self._auth_session_cache = payload
+        self._auth_session_loaded = True
+
+    def _resolve_admin_create_access_source(self):
+        parsed_query = parse_qs(urlparse(self.path).query or "")
+        provided_access = str(
+            (parsed_query.get(self.ADMIN_CREATE_LINK_QUERY_PARAM) or [""])[0] or ""
+        ).strip()
+        configured_access = str(
+            os.environ.get("ADMIN_CREATE_LINK_TOKEN")
+            or os.environ.get("ESI_ADMIN_CREATE_LINK_TOKEN")
+            or ""
+        ).strip()
+
+        if provided_access:
+            if configured_access and hmac.compare_digest(provided_access, configured_access):
+                return "admin_create_link"
+            return None
+
+        return "admin_create_open"
+
+    def _issue_admin_create_only_session(self, source="admin_create_open"):
+        admin_user, admin_name, admin_level = self._resolve_scoped_admin_identity()
+        admin_session_token, payload = self.session_security.create_signed_token(
+            {
+                "role": "admin",
+                "usuario": admin_user,
+                "nome": admin_name,
+                "nivel": admin_level,
+                "source": source,
+                "scope": self.ADMIN_CREATE_SESSION_SCOPE,
+            }
+        )
+        self.queue_response_header(
+            "Set-Cookie",
+            self.session_security.build_set_cookie_header(admin_session_token),
+        )
+        self._auth_session_cache = payload
+        self._auth_session_loaded = True
+
+    def _issue_local_admin_session(self):
+        admin_user, admin_name, admin_level = self._resolve_scoped_admin_identity()
 
         admin_session_token, _ = self.session_security.create_signed_token(
             {
@@ -863,6 +977,30 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         session = self.get_auth_session()
         if (
             allowed_roles == {"admin"}
+            and path.startswith(self.ADMIN_DIRECT_ROUTE_PREFIX)
+            and self.command == "GET"
+        ):
+            if not session:
+                self._issue_remote_admin_session()
+                return True
+
+            if self._is_admin_create_only_session(session):
+                self._issue_remote_admin_session(source="admin_direct_upgrade")
+                return True
+
+        if (
+            allowed_roles == {"admin"}
+            and path == self.ADMIN_CREATE_ROUTE
+            and self.command == "GET"
+            and not session
+        ):
+            access_source = self._resolve_admin_create_access_source()
+            if access_source:
+                self._issue_admin_create_only_session(source=access_source)
+                return True
+
+        if (
+            allowed_roles == {"admin"}
             and self._is_local_request()
             and (path.startswith("/admin/") or path.startswith("/api/"))
             and (not session or session.get("role") != "admin")
@@ -872,6 +1010,13 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         if not session:
             self._unauthorized_response(path)
+            return False
+
+        if self._is_admin_create_only_session(session) and not self._can_use_admin_create_only_session(
+            path,
+            session=session,
+        ):
+            self._unauthorized_response(path, ",".join(sorted(allowed_roles)))
             return False
 
         if session.get("role") not in set(allowed_roles):
@@ -941,10 +1086,12 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         }
 
     def _build_system_bootstrap_payload(
-        self, include_admin_sections=False, sanitize_for_client=False
+        self,
+        include_admin_sections=False,
+        sanitize_for_client=False,
+        include_storage_status=False,
     ):
         dados_payload = self.routes_core.system_repository.get_dados_payload()
-        storage_status = self.routes_core.handle_get_storage_status()
         base_payload = {
             "constants": dados_payload.get("constants", {}),
             "machines": self.routes_core.machine_repository.get_all(),
@@ -952,8 +1099,12 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             "banco_acessorios": dados_payload.get("banco_acessorios", {}),
             "dutos": dados_payload.get("dutos", []),
             "tubos": dados_payload.get("tubos", []),
-            "storage_status": storage_status,
         }
+
+        if include_storage_status:
+            base_payload["storage_status"] = (
+                self.routes_core.handle_get_storage_status()
+            )
 
         if include_admin_sections:
             base_payload.update(
@@ -1015,6 +1166,13 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if path == "/health-check":
             return False
 
+        if path in {
+            "/api/runtime/bootstrap",
+            "/api/runtime/system-bootstrap",
+            "/api/admin/email-config",
+        }:
+            return False
+
         if path.startswith("/api/") or path == "/obras" or path.startswith("/obras/"):
             return True
 
@@ -1061,6 +1219,14 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response)
 
+    def _should_inline_bootstrap_for_route(self, route_path):
+        return str(os.environ.get("ESI_INLINE_PAGE_BOOTSTRAP", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def _build_page_context_script(self, route_path):
         script_parts = []
         session = self.get_auth_session()
@@ -1076,11 +1242,15 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 f"window.__APP_BOOT__={self._serialize_script_payload(bridge_payload)};"
             )
 
-        if route_path in {"/obras/create", "/admin/obras/create", "/admin/obras/embed"}:
+        if (
+            route_path in {"/obras/create", "/admin/obras/create", "/admin/obras/embed"}
+            and self._should_inline_bootstrap_for_route(route_path)
+        ):
             runtime_payload = self._build_runtime_bootstrap_payload()
             system_payload = self._build_system_bootstrap_payload(
                 include_admin_sections=False,
                 sanitize_for_client=not self._has_role("admin"),
+                include_storage_status=False,
             )
             script_parts.append(
                 f"window.__RUNTIME_BOOTSTRAP__={self._serialize_script_payload(runtime_payload)};"
@@ -1089,9 +1259,13 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 f"window.__SYSTEM_BOOTSTRAP__={self._serialize_script_payload(system_payload)};"
             )
 
-        if route_path == "/admin/data":
+        if (
+            route_path == "/admin/data"
+            and self._should_inline_bootstrap_for_route(route_path)
+        ):
             system_payload = self._build_system_bootstrap_payload(
-                include_admin_sections=True
+                include_admin_sections=True,
+                include_storage_status=True,
             )
             script_parts.append(
                 f"window.__SYSTEM_BOOTSTRAP__={self._serialize_script_payload(system_payload)};"
@@ -1162,6 +1336,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self._build_system_bootstrap_payload(
                 include_admin_sections=self._has_role("admin"),
                 sanitize_for_client=not self._has_role("admin"),
+                include_storage_status=False,
             )
         )
 
@@ -1996,15 +2171,15 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         token = str(recovery_target.get("token") or "").strip()
         nome = str(recovery_target.get("nome") or usuario).strip()
 
-        subject = f"Recuperacao de token | ESI Energia | {context}".strip()
+        subject = f"Recuperacao de senha | ESI Energia | {context}".strip()
         message = "\n".join(
             [
                 f"Olá, {nome}.",
-                f"Recebemos uma solicitacao de recuperacao de token para o acesso {account_label}.",
+                f"Recebemos uma solicitacao de recuperacao de senha para o acesso {account_label}.",
                 "Dados da solicitacao:",
                 f"Contexto: {context}",
                 f"Usuario: {usuario}",
-                f"Token atual: {token}",
+                f"Senha atual: {token}",
                 "Se voce nao solicitou esta recuperacao, ignore esta mensagem e entre em contato com o responsavel pelo sistema para verificar a seguranca da sua conta.",
                 "Atenciosamente,",
                 "Equipe ESI Energia",
@@ -2082,7 +2257,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(
                 {
                     "success": False,
-                    "error": "Foi encontrada mais de uma conta com este usuario e email. Solicite o token ao administrador do sistema.",
+                    "error": "Foi encontrada mais de uma conta com este usuario e email. Solicite a senha ao administrador do sistema.",
                 },
                 409,
             )
@@ -2112,7 +2287,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_json_response(
             {
                 "success": True,
-                "message": "Solicitacao recebida. O token sera enviado para o email cadastrado em instantes.",
+                "message": "Solicitacao recebida. A senha sera enviada para o email cadastrado em instantes.",
                 "job_id": job_id,
             },
             200,
@@ -4160,19 +4335,21 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             
 
     def handle_get_admin_email_config(self):
-        """GET /api/admin/email-config - Retorna configuracao SMTP do ADM."""
+        """GET /api/admin/email-config - Retorna configuracao de envio do ADM."""
         try:
             from servidor_modules.utils.admin_email_config import AdminEmailConfigStore
 
             config_store = AdminEmailConfigStore(self.project_root)
             config = config_store.load()
+            delivery_mode = config_store.resolve_delivery_mode(config)
 
             self.send_json_response(
                 {
                     "success": True,
                     "config": config,
                     "configured": config_store.is_configured(config),
-                    "smtpResolved": config_store.resolve_smtp_settings(config),
+                    "deliveryMode": delivery_mode,
+                    "resendConfigured": delivery_mode == "resend",
                 }
             )
         except Exception as e:
@@ -4183,19 +4360,18 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             )
 
     def handle_post_admin_email_config(self):
-        """POST /api/admin/email-config - Salva configuracao SMTP do ADM."""
+        """POST /api/admin/email-config - Salva configuracao de envio do ADM."""
         try:
             from datetime import datetime
 
             from servidor_modules.utils.admin_email_config import (
                 AdminEmailConfigStore,
+                get_resend_api_key,
                 is_valid_email,
             )
-            from servidor_modules.utils.export_utils import validate_smtp_secret
 
             payload = self._read_json_body()
             email = str(payload.get("email") or payload.get("adminEmail") or "").strip()
-            token = str(payload.get("token") or payload.get("adminToken") or "").strip()
             nome = str(payload.get("nome") or payload.get("adminNome") or "").strip()
 
             if not email or not is_valid_email(email):
@@ -4205,9 +4381,12 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 )
                 return
 
-            if not token:
+            if not get_resend_api_key():
                 self.send_json_response(
-                    {"success": False, "error": "Informe a senha ou token SMTP."},
+                    {
+                        "success": False,
+                        "error": "Configure RESEND_API no arquivo .env antes de salvar o email de envio.",
+                    },
                     status=400,
                 )
                 return
@@ -4219,21 +4398,11 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 )
                 return
 
-            try:
-                validate_smtp_secret(email, token)
-            except RuntimeError as exc:
-                self.send_json_response(
-                    {"success": False, "error": str(exc)},
-                    status=400,
-                )
-                return
-
             config_store = AdminEmailConfigStore(self.project_root)
             saved_config = config_store.save(
                 {
                     **payload,
                     "email": email,
-                    "token": token,
                     "nome": nome,
                     "updatedAt": datetime.now().isoformat(),
                 }
@@ -4244,7 +4413,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     "success": True,
                     "message": "Configuracao de email salva com sucesso.",
                     "config": saved_config,
-                    "smtpResolved": config_store.resolve_smtp_settings(saved_config),
+                    "deliveryMode": config_store.resolve_delivery_mode(saved_config),
                 }
             )
         except json.JSONDecodeError:
@@ -4897,7 +5066,7 @@ class UniversalHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         config_store = AdminEmailConfigStore(self.project_root)
         config = config_store.load()
         if not config_store.is_configured(config):
-            raise RuntimeError("Configuracao SMTP do ADM nao encontrada.")
+            raise RuntimeError("Configuracao de email do ADM nao encontrada.")
 
         repository = ObraNotificationRepository(self.project_root)
         current_fingerprint = self._build_notification_fingerprint(obra)

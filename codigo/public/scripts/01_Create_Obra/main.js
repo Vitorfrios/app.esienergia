@@ -6,9 +6,27 @@
 // IMPORTAR LOGGER
 import { createSmartLogger } from "./core/logger.js";
 import { APP_CONFIG, isFeatureEnabled } from "./core/config.js";
-import "./core/runtime-data.js";
-import "./core/system-bootstrap.js";
+import "../03_Edit_data/config/request-bridge.js";
+import { loadRuntimeBootstrap } from "./core/runtime-data.js";
+import { loadSystemBootstrap } from "./core/system-bootstrap.js";
 import { bootstrapClientMode } from "./main-folder/client-mode.js";
+
+function prewarmInitialBootstraps() {
+  const routePath = String(window.location.pathname || "").trim();
+  if (
+    routePath !== "/admin/obras/create" &&
+    routePath !== "/obras/create" &&
+    routePath !== "/admin/obras/embed"
+  ) {
+    return;
+  }
+
+  Promise.allSettled([loadRuntimeBootstrap(), loadSystemBootstrap()]).catch(
+    () => {},
+  );
+}
+
+prewarmInitialBootstraps();
 
 // INICIALIZAR LOGGER IMEDIATAMENTE
 Object.defineProperty(window, "logger", {

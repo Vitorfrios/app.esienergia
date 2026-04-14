@@ -4,7 +4,12 @@ import { showConfirmation, showError, showSuccess, showInfo } from '../config/ui
 const adminState = {
     search: '',
     initialized: false,
-    modalListenerBound: false
+    modalListenerBound: false,
+    emailConfig: null,
+    emailConfigLoaded: false,
+    emailConfigLoading: false,
+    emailConfigSaving: false,
+    emailConfigPromise: null
 };
 
 function escapeHtml(text) {
@@ -77,6 +82,159 @@ function getAdmins() {
     }
 
     return [];
+}
+
+function getPrimaryAdminEmailSuggestion() {
+    const admins = getAdmins();
+    const matchedAdmin = admins.find((admin) => isValidEmail(admin.email));
+    return String(matchedAdmin?.email || '').trim();
+}
+
+function normalizeEmailConfigPayload(payload = {}) {
+    const config = payload?.config && typeof payload.config === 'object' ? payload.config : {};
+    const email = String(config.email || '').trim();
+    const nome = String(config.nome || 'ESI Energia').trim() || 'ESI Energia';
+    const deliveryMode = String(payload?.deliveryMode || 'unconfigured').trim() || 'unconfigured';
+
+    return {
+        configured: Boolean(payload?.configured),
+        resendConfigured: Boolean(payload?.resendConfigured),
+        deliveryMode,
+        config: {
+            email,
+            nome
+        }
+    };
+}
+
+async function loadAdminEmailConfig({ force = false, rerender = true } = {}) {
+    if (force) {
+        adminState.emailConfigPromise = null;
+        adminState.emailConfigLoading = false;
+    }
+
+    if (adminState.emailConfigPromise) {
+        return adminState.emailConfigPromise;
+    }
+
+    adminState.emailConfigLoading = true;
+    if (rerender) {
+        renderAdminCredentials();
+    }
+
+    adminState.emailConfigPromise = fetch('/api/admin/email-config', {
+        cache: 'no-store',
+        headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            Pragma: 'no-cache'
+        }
+    })
+        .then(async (response) => {
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.success) {
+                throw new Error(result.error || 'Nao foi possivel carregar o email de envio.');
+            }
+
+            adminState.emailConfig = normalizeEmailConfigPayload(result);
+            adminState.emailConfigLoaded = true;
+            return adminState.emailConfig;
+        })
+        .catch((error) => {
+            adminState.emailConfig = normalizeEmailConfigPayload({});
+            adminState.emailConfigLoaded = true;
+            throw error;
+        })
+        .finally(() => {
+            adminState.emailConfigLoading = false;
+            adminState.emailConfigPromise = null;
+            if (rerender) {
+                renderAdminCredentials();
+            }
+        });
+
+    return adminState.emailConfigPromise;
+}
+
+function renderAdminEmailConfigPanel() {
+    const emailConfig = adminState.emailConfig || normalizeEmailConfigPayload({});
+    const senderEmail = escapeHtml(emailConfig.config.email || '');
+    const senderName = escapeHtml(emailConfig.config.nome || 'ESI Energia');
+    const suggestionEmail = getPrimaryAdminEmailSuggestion();
+    const saveDisabled = adminState.emailConfigSaving ? 'disabled' : '';
+    const useSuggestionDisabled = !suggestionEmail || adminState.emailConfigSaving ? 'disabled' : '';
+
+    return `
+        <section class="admin-email-config-panel">
+            <div class="admin-email-config-header">
+                <div class="admin-section-copy">
+                    <span class="dashboard-eyebrow">Envio</span>
+                    <h3>Email de envio</h3>
+                    <p>Esse remetente sera usado nas exportacoes por email e na recuperacao de senha.</p>
+                </div>
+            </div>
+
+            <div class="admin-email-config-grid">
+                <label class="admin-email-field">
+                    <span>Email remetente</span>
+                    <input id="adminSenderEmailInput" type="email" value="${senderEmail}" placeholder="matheus@esi.energia.com" ${saveDisabled}>
+                </label>
+
+                <label class="admin-email-field">
+                    <span>Nome do remetente</span>
+                    <input id="adminSenderNameInput" type="text" value="${senderName}" placeholder="ESI Energia" ${saveDisabled}>
+                </label>
+            </div>
+
+            <div class="admin-email-config-actions">
+                <button class="btn-icon" id="adminUsePrimaryEmailBtn" type="button" ${useSuggestionDisabled}>Usar email do ADM</button>
+                <button class="btn-add-admin" id="adminSaveEmailConfigBtn" type="button" ${saveDisabled}>
+                    ${adminState.emailConfigSaving ? 'Salvando...' : 'Salvar email de envio'}
+                </button>
+            </div>
+        </section>
+    `;
+}
+
+async function saveAdminEmailConfigFromPanel() {
+    const emailInput = document.getElementById('adminSenderEmailInput');
+    const nomeInput = document.getElementById('adminSenderNameInput');
+    const email = String(emailInput?.value || '').trim();
+    const nome = String(nomeInput?.value || '').trim() || 'ESI Energia';
+
+    if (!email || !isValidEmail(email)) {
+        showError('Informe um email valido para o envio.');
+        return;
+    }
+
+    adminState.emailConfigSaving = true;
+    renderAdminCredentials();
+
+    try {
+        const response = await fetch('/api/admin/email-config', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                email,
+                nome
+            })
+        });
+
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || 'Nao foi possivel salvar o email de envio.');
+        }
+
+        adminState.emailConfig = normalizeEmailConfigPayload(result);
+        adminState.emailConfigLoaded = true;
+        showSuccess('Email de envio salvo com sucesso.');
+    } catch (error) {
+        showError(error.message || 'Falha ao salvar o email de envio.');
+    } finally {
+        adminState.emailConfigSaving = false;
+        renderAdminCredentials();
+    }
 }
 
 function saveAdmins(admins) {
@@ -230,10 +388,6 @@ function renderAdminCard(admin, index) {
                     <span class="detail-value admin-token-value">${escapeHtml(admin.token)}</span>
                 </div>
                 <div class="admin-card-detail">
-                    <span class="detail-label">Preview</span>
-                    <span class="detail-value">${escapeHtml(maskToken(admin.token))}</span>
-                </div>
-                <div class="admin-card-detail">
                     <span class="detail-label">Criado em</span>
                     <span class="detail-value">${escapeHtml(formatDate(admin.criadoEm))}</span>
                 </div>
@@ -260,6 +414,8 @@ export function renderAdminCredentials() {
     const filteredAdmins = filterAdmins(admins);
 
     container.innerHTML = `
+        ${renderAdminEmailConfigPanel()}
+
         <div class="admin-section-header admin-section-header-panel">
             <div class="admin-section-copy">
                 <span class="dashboard-eyebrow">ADM</span>
@@ -440,9 +596,32 @@ function bindAdminEvents() {
     const closeModalBtn = document.getElementById('closeAdminModalBtn');
     const cancelBtn = document.getElementById('cancelAdminCredentialBtn');
     const generateBtn = document.getElementById('generateAdminTokenBtn');
+    const saveEmailConfigBtn = document.getElementById('adminSaveEmailConfigBtn');
+    const usePrimaryEmailBtn = document.getElementById('adminUsePrimaryEmailBtn');
 
     if (addBtn) {
         addBtn.onclick = () => openAdminModal();
+    }
+
+    if (saveEmailConfigBtn) {
+        saveEmailConfigBtn.onclick = saveAdminEmailConfigFromPanel;
+    }
+
+    if (usePrimaryEmailBtn) {
+        usePrimaryEmailBtn.onclick = () => {
+            const emailInput = document.getElementById('adminSenderEmailInput');
+            if (!emailInput) {
+                return;
+            }
+
+            const suggestionEmail = getPrimaryAdminEmailSuggestion();
+            if (!suggestionEmail) {
+                showInfo('Nenhum email de ADM disponivel para reaproveitar.');
+                return;
+            }
+
+            emailInput.value = suggestionEmail;
+        };
     }
 
     if (adminGrid) {
@@ -496,6 +675,12 @@ function bindAdminEvents() {
 
 export function initializeAdminCredentials() {
     renderAdminCredentials();
+
+    if (!adminState.emailConfigLoaded && !adminState.emailConfigLoading) {
+        loadAdminEmailConfig().catch((error) => {
+            showError(error.message || 'Falha ao carregar o email de envio.');
+        });
+    }
 
     if (adminState.initialized) {
         return;

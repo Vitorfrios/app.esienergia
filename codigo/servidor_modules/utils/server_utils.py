@@ -108,6 +108,15 @@ class ServerUtils:
             return False
 
     @staticmethod
+    def _should_use_app_browser_window():
+        return str(os.environ.get("ESI_BROWSER_APP_MODE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
     def open_browser(port=8000):
         """Abre o navegador automaticamente."""
         time.sleep(2)
@@ -116,7 +125,7 @@ class ServerUtils:
         print(f" Abrindo aplicacao: {url}")
 
         try:
-            if ServerUtils._open_browser_app_window(url):
+            if ServerUtils._should_use_app_browser_window() and ServerUtils._open_browser_app_window(url):
                 return
 
             import webbrowser

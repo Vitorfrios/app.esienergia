@@ -60,7 +60,7 @@ class SystemRepository:
         ("salas", "COALESCE(SUM(octet_length(raw_json)), 0)"),
         ("sala_maquinas", "COALESCE(SUM(octet_length(raw_json)), 0)"),
         ("sessions", "COALESCE(SUM(octet_length(payload_json)), 0)"),
-        ("admin_email_config", "COALESCE(SUM(octet_length(email) + octet_length(token) + octet_length(nome) + octet_length(smtp_host) + octet_length(COALESCE(updated_at, ''))), 0)"),
+        ("admin_email_config", "COALESCE(SUM(octet_length(email) + octet_length(nome) + octet_length(COALESCE(updated_at, ''))), 0)"),
         ("obra_notifications", "COALESCE(SUM(octet_length(fingerprint) + octet_length(last_subject) + octet_length(last_message) + octet_length(last_sent_at) + octet_length(obra_id)), 0)"),
     )
 

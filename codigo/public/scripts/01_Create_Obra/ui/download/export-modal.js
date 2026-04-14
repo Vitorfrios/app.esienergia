@@ -202,7 +202,7 @@ function renderDetailStep(state, shell) {
   const needsEmail = state.selectedType === "email" || state.selectedType === "completo";
   const emailConfig = state.emailConfig?.config || {};
   const emailConfigLoaded = state.emailConfig !== null;
-  const smtpConfigured = Boolean(state.emailConfig?.configured);
+  const emailConfigured = Boolean(state.emailConfig?.configured);
   const selfEmail = (emailConfig.email || "").trim();
   const recipientValue = resolveVisibleRecipientValue(state, selfEmail);
 
@@ -236,7 +236,7 @@ function renderDetailStep(state, shell) {
           <div class="export-inline-alert export-inline-alert-info">
             Carregando a configuração de email do ADM...
           </div>
-        ` : smtpConfigured ? `
+        ` : emailConfigured ? `
           <div class="export-sender-chip">Remetente: <strong>${escapeHtml(emailConfig.nome || "Administrador")}</strong> · ${escapeHtml(selfEmail)}</div>
         ` : `
           <div class="export-inline-alert export-inline-alert-error">

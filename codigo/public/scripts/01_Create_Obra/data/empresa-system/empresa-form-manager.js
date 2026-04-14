@@ -4,7 +4,6 @@
  * Responsabilidade: Formulários inline, datepicker, validação, campos de data
  */
 
-import { EmpresaCadastroInline } from "./empresa-core.js";
 import { inicializarInputEmpresaHibrido } from "./empresa-autocomplete.js";
 import { APP_CONFIG } from "../../core/config.js";
 import { loadSystemBootstrap } from "../../core/system-bootstrap.js";
@@ -14,7 +13,6 @@ import {
   permitirApenasNumerosEControles,
 } from "./empresa-ui-helpers.js";
 
-const empresa = new EmpresaCadastroInline();
 let adminEmpresasCachePromise = null;
 const EMPRESA_CREDENTIAL_DRAFT_PREFIX = "esi.empresaCredentialDraft.";
 let empresaCredentialStorageListenerBound = false;
@@ -34,6 +32,26 @@ function escapeHtml(value) {
   const div = document.createElement("div");
   div.textContent = value ?? "";
   return div.innerHTML;
+}
+
+function formatEmpresaDate(value) {
+  if (!value) {
+    return "";
+  }
+
+  if (typeof value === "string" && /^\d{2}\/\d{2}\/\d{4}$/.test(value)) {
+    return value;
+  }
+
+  const parsedDate = new Date(value);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return value;
+  }
+
+  const day = String(parsedDate.getDate()).padStart(2, "0");
+  const month = String(parsedDate.getMonth() + 1).padStart(2, "0");
+  const year = parsedDate.getFullYear();
+  return `${day}/${month}/${year}`;
 }
 
 function generateEmpresaAccessToken(length = 32) {
@@ -808,7 +826,7 @@ function atualizarCamposEmpresaForm(obraData, formElement) {
     if (input && obraData[dataField]) {
       // FORMATAR DATA SE FOR O CAMPO dataCadastro
       if (dataField === "dataCadastro") {
-        input.value = empresa.formatarData(obraData[dataField]);
+        input.value = formatEmpresaDate(obraData[dataField]);
       } else {
         input.value = obraData[dataField];
       }
